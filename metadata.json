@@ -1,0 +1,8 @@
+{
+  "name": "Anything AI - Live Voice",
+  "description": "A high-fidelity Gemini AI interface clone with full real-time conversational audio capabilities.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}
