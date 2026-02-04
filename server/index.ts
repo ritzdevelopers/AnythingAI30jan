@@ -145,6 +145,11 @@ app.post('/api/chat/stream', (req, res) => {
 
 app.use(apiErrorBoundary);
 
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
+// Only start listening when running locally (not on Vercel serverless)
+if (process.env.VERCEL !== '1') {
+  app.listen(PORT, () => {
+    console.log(`Server running at http://localhost:${PORT}`);
+  });
+}
+
+export { app };
