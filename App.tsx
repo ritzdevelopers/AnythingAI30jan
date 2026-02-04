@@ -4,7 +4,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { Copy, Check, RefreshCw, Loader2, Home, Compass, Layers, User, Settings } from 'lucide-react';
+import { Copy, Check, RefreshCw, Loader2, Home, History, Layers, User, Settings } from 'lucide-react';
+import { motion } from 'framer-motion';
 import SearchAnimation, { SearchStep, SearchSource } from './components/SearchAnimation';
 
 // --- SSE stream types (from backend) ---
@@ -59,6 +60,7 @@ interface ChatMessage {
   time?: TimeData | null;
   webResults?: WebResult[];
   lastUpdated?: string;
+  sourceCount?: number; // Number of sources reviewed
 }
 
 interface ChatSession {
@@ -72,7 +74,51 @@ interface ChatSession {
 // --- Utilities ---
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
-const App: React.FC = () => {
+/**
+ * Extract clean domain name from URL, handling Vertex AI Search proxy URLs
+ */
+const extractDomainFromUrl = (url: string): { domain: string; cleanUrl: string } => {
+  let domain = 'source';
+  let cleanUrl = url;
+  
+  try {
+    const urlObj = new URL(url);
+    
+    // Handle Vertex AI Search proxy URLs
+    if (urlObj.hostname.includes('vertexaisearch')) {
+      const originalUrl = urlObj.searchParams.get('url');
+      if (originalUrl) {
+        cleanUrl = decodeURIComponent(originalUrl);
+        try {
+          const originalUrlObj = new URL(cleanUrl);
+          domain = originalUrlObj.hostname.replace('www.', '');
+        } catch {
+          domain = 'source';
+        }
+      } else {
+        domain = 'source';
+      }
+    } else {
+      domain = urlObj.hostname.replace('www.', '');
+    }
+  } catch {
+    // Fallback: try to extract from query params
+    const match = url.match(/[?&]url=([^&]+)/);
+    if (match) {
+      try {
+        const decoded = decodeURIComponent(match[1]);
+        cleanUrl = decoded;
+        domain = new URL(decoded).hostname.replace('www.', '');
+      } catch {
+        domain = 'source';
+      }
+    }
+  }
+  
+  return { domain, cleanUrl };
+};
+
+const App = () => {
   // Navigation State
   const [currentView, setCurrentView] = useState<'home' | 'chat' | 'spaces' | 'select-space' | 'history'>('home');
   const [activeSpace, setActiveSpace] = useState<Space | null>(null);
@@ -227,7 +273,17 @@ const App: React.FC = () => {
   const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSendText();
+      // Will be handled by sendPrompt function defined below
+      const userMessage = inputValue.trim();
+      if (userMessage || selectedImage) {
+        // Trigger send via the send button click
+        setTimeout(() => {
+          const sendBtn = document.querySelector('button[type="button"]:not([disabled])') as HTMLButtonElement;
+          if (sendBtn && (inputValue.trim() || selectedImage)) {
+            sendBtn.click();
+          }
+        }, 0);
+      }
     }
   };
 
@@ -259,97 +315,55 @@ const App: React.FC = () => {
     ].slice(0, 3);
   };
 
-  // Simulate search animation steps
-  const runSearchAnimation = async (query: string): Promise<SearchSource[]> => {
+  // Initialize search animation - sources will be added in real-time from backend
+  const runSearchAnimation = async (query: string): Promise<void> => {
     setCurrentSearchQuery(query);
     setSearchSteps([]);
     setSearchSources([]);
 
-    // Step 1: Retrieving
+    // Step 1: Retrieving (Perplexity style)
     const step1: SearchStep = {
       id: '1',
-      text: `Retrieving information about "${query.slice(0, 40)}${query.length > 40 ? '...' : ''}"`,
+      text: `Retrieving latest information about "${query.slice(0, 40)}${query.length > 40 ? '...' : ''}"`,
       status: 'active',
     };
     setSearchSteps([step1]);
-    await new Promise(r => setTimeout(r, 800));
+    await new Promise(r => setTimeout(r, 600));
 
-    // Step 2: Searching
+    // Step 2: Searching (Perplexity style with query pills)
     const searchQueries = generateSearchQueries(query);
+    // Generate more specific queries for better results
+    const enhancedQueries = [
+      query,
+      ...searchQueries.slice(1),
+      `${query} ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`,
+      `${query} latest updates`
+    ].slice(0, 4);
+    
     const step2: SearchStep = {
       id: '2',
       text: 'Searching',
       status: 'active',
-      queries: searchQueries,
+      queries: enhancedQueries,
     };
     setSearchSteps(prev => [
       { ...prev[0], status: 'complete' },
       step2
     ]);
-    await new Promise(r => setTimeout(r, 1200));
-
-    // Generate mock sources based on query
-    const mockSources: SearchSource[] = [
-      {
-        id: '1',
-        title: `Latest updates and information on ${query.slice(0, 30)}...`,
-        url: 'https://example.com/article1',
-        domain: 'timesofindia.indiatimes',
-      },
-      {
-        id: '2', 
-        title: `Top insights and analysis for ${query.slice(0, 25)}...`,
-        url: 'https://example.com/article2',
-        domain: 'economictimes.com',
-      },
-      {
-        id: '3',
-        title: `Expert guide: Everything about ${query.slice(0, 20)}...`,
-        url: 'https://example.com/article3',
-        domain: 'moneycontrol.com',
-      },
-      {
-        id: '4',
-        title: `${query.slice(0, 35)} - Complete Overview`,
-        url: 'https://example.com/article4',
-        domain: 'livemint.com',
-      },
-      {
-        id: '5',
-        title: `Breaking: New developments in ${query.slice(0, 25)}...`,
-        url: 'https://example.com/article5',
-        domain: 'hindustantimes.com',
-      },
-    ];
-
-    // Step 3: Reviewing sources
+    await new Promise(r => setTimeout(r, 800));
+    
+    // Step 3: Reviewing sources (will be updated when sources arrive)
     setSearchSteps(prev => [
       prev[0],
-      { ...prev[1], status: 'complete' },
-      { id: '3', text: `Reviewing ${mockSources.length} sources`, status: 'active' }
+      { ...prev[1], status: 'active' },
+      { id: '3', text: 'Reviewing sources...', status: 'active' }
     ]);
     
-    // Add sources with stagger
-    for (let i = 0; i < mockSources.length; i++) {
-      await new Promise(r => setTimeout(r, 150));
-      setSearchSources(prev => [...prev, mockSources[i]]);
-    }
-    
-    await new Promise(r => setTimeout(r, 600));
-
-    // Step 4: Synthesizing
+    // Step 4: Synthesizing (will be updated when response starts)
     setSearchSteps(prev => [
-      prev[0],
-      prev[1],
-      { ...prev[2], status: 'complete' },
-      { id: '4', text: 'Synthesizing answer...', status: 'active' }
+      ...prev,
+      { id: '4', text: 'Synthesizing answer...', status: 'pending' }
     ]);
-    await new Promise(r => setTimeout(r, 500));
-
-    // Complete all steps
-    setSearchSteps(prev => prev.map(s => ({ ...s, status: 'complete' as const })));
-    
-    return mockSources;
   };
 
   const fetchLiveWeather = async (query: string): Promise<WeatherData | null> => {
@@ -376,50 +390,151 @@ const App: React.FC = () => {
     }
   };
 
-  const MarkdownRenderer = ({ content }: { content: string }) => (
-    <div className="prose prose-invert max-w-none prose-p:leading-relaxed prose-p:my-2 prose-table:my-4 prose-th:bg-[#1e1f20] prose-td:border-white/10 prose-th:border-white/10">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          code({ inline, className, children, ...props }: any) {
-          const match = /language-(\w+)/.exec(className || '');
-          const code = String(children).replace(/\n$/, '');
-          if (inline || !match) {
-            return (
-              <code className="px-1 py-0.5 rounded bg-white/10 text-[#e3e3e3]" {...props}>
-                {children}
-              </code>
-            );
-          }
-          return (
-            <div className="relative group">
-              <button
-                onClick={() => copyToClipboard(code, -1)}
-                className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition text-xs px-2 py-1 rounded bg-white/10 text-white"
-              >
-                Copy
-              </button>
-              <SyntaxHighlighter style={oneDark} language={match[1]} PreTag="div">
-                {code}
-              </SyntaxHighlighter>
-            </div>
-          );
-          },
-          table({ children }: any) {
-            return <table className="w-full border border-white/10">{children}</table>;
-          },
-          th({ children }: any) {
-            return <th className="border border-white/10 px-3 py-2 text-left">{children}</th>;
-          },
-          td({ children }: any) {
-            return <td className="border border-white/10 px-3 py-2">{children}</td>;
-          },
-        }}
-      >
-        {content}
-      </ReactMarkdown>
-    </div>
-  );
+  // Component for inline source citations (Perplexity style)
+  const SourceBadge = ({ domain, isYouTube }: { domain: string; isYouTube?: boolean }) => {
+    const cleanDomain = domain.replace('www.', '').split('.')[0];
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 mx-1 rounded-md bg-[#282a2c] border border-white/10 text-[10px] text-[#e3e3e3] font-medium align-middle">
+        {isYouTube && (
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="#FF0000" className="inline">
+            <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
+          </svg>
+        )}
+        {cleanDomain}
+      </span>
+    );
+  };
+
+  // Parse text and add inline source citations
+  const parseInlineCitations = (text: string, webResults?: WebResult[]): React.ReactNode[] => {
+    if (!webResults || webResults.length === 0) {
+      return [text];
+    }
+
+    // Create a map of domains to results for quick lookup
+    const domainMap = new Map<string, WebResult[]>();
+    webResults.forEach(result => {
+      const { domain } = extractDomainFromUrl(result.link);
+      if (!domainMap.has(domain)) {
+        domainMap.set(domain, []);
+      }
+      domainMap.get(domain)!.push(result);
+    });
+
+    // Pattern to match citations like [source: domain] or [domain] or just domain mentions
+    const citationPattern = /\[source:\s*([^\]]+)\]|\[([^\]]+)\]|(\b(?:ndtv|indianexpress|youtube|economictimes|indiatoday|thefederal|affairscloud|livemint|moneycontrol|hindustantimes|timesofindia)\b)/gi;
+    
+    const parts: React.ReactNode[] = [];
+    let lastIndex = 0;
+    let match;
+
+    while ((match = citationPattern.exec(text)) !== null) {
+      // Add text before citation
+      if (match.index > lastIndex) {
+        parts.push(text.slice(lastIndex, match.index));
+      }
+
+      // Extract domain from citation
+      const citedDomain = (match[1] || match[2] || match[3] || '').toLowerCase().trim();
+      const foundDomain = Array.from(domainMap.keys()).find(d => 
+        d.toLowerCase().includes(citedDomain) || citedDomain.includes(d.toLowerCase().split('.')[0])
+      );
+
+      if (foundDomain) {
+        const isYouTube = foundDomain.toLowerCase().includes('youtube') || foundDomain.toLowerCase().includes('youtu.be');
+        parts.push(<SourceBadge key={`badge-${match.index}`} domain={foundDomain} isYouTube={isYouTube} />);
+      } else {
+        // If domain not found, just show the text
+        parts.push(match[0]);
+      }
+
+      lastIndex = match.index + match[0].length;
+    }
+
+    // Add remaining text
+    if (lastIndex < text.length) {
+      parts.push(text.slice(lastIndex));
+    }
+
+    return parts.length > 0 ? parts : [text];
+  };
+
+  const MarkdownRenderer = ({ content, webResults }: { content: string; webResults?: WebResult[] }) => {
+    // Check if content has inline citations or if we should add them
+    const hasInlineCitations = /\[source:|\[.*\]/.test(content);
+    
+    return (
+      <div className="prose prose-invert max-w-none prose-p:leading-relaxed prose-p:my-2 prose-table:my-4 prose-th:bg-[#1e1f20] prose-td:border-white/10 prose-th:border-white/10">
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            p({ children }: any) {
+              // Extract text content from children
+              const extractText = (node: any): string => {
+                if (typeof node === 'string') return node;
+                if (React.isValidElement(node)) {
+                  const props = node.props as any;
+                  if (props?.children) {
+                    return React.Children.toArray(props.children)
+                      .map(extractText)
+                      .join('');
+                  }
+                }
+                return '';
+              };
+              
+              const textContent = React.Children.toArray(children)
+                .map(extractText)
+                .join('');
+              
+              // Parse inline citations if we have webResults
+              if (webResults && webResults.length > 0 && textContent) {
+                const parsed = parseInlineCitations(textContent, webResults);
+                return <p className="mb-3 leading-relaxed inline-flex flex-wrap items-baseline gap-1">{parsed}</p>;
+              }
+              
+              return <p className="mb-3 leading-relaxed">{children}</p>;
+            },
+            code({ inline, className, children, ...props }: any) {
+              const match = /language-(\w+)/.exec(className || '');
+              const code = String(children).replace(/\n$/, '');
+              if (inline || !match) {
+                return (
+                  <code className="px-1 py-0.5 rounded bg-white/10 text-[#e3e3e3]" {...props}>
+                    {children}
+                  </code>
+                );
+              }
+              return (
+                <div className="relative group">
+                  <button
+                    onClick={() => copyToClipboard(code, -1)}
+                    className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition text-xs px-2 py-1 rounded bg-white/10 text-white"
+                  >
+                    Copy
+                  </button>
+                  <SyntaxHighlighter style={oneDark} language={match[1]} PreTag="div">
+                    {code}
+                  </SyntaxHighlighter>
+                </div>
+              );
+            },
+            table({ children }: any) {
+              return <table className="w-full border border-white/10">{children}</table>;
+            },
+            th({ children }: any) {
+              return <th className="border border-white/10 px-3 py-2 text-left">{children}</th>;
+            },
+            td({ children }: any) {
+              return <td className="border border-white/10 px-3 py-2">{children}</td>;
+            },
+          }}
+        >
+          {content}
+        </ReactMarkdown>
+      </div>
+    );
+  };
 
   const sendPrompt = async (
     userMessage: string,
@@ -622,12 +737,58 @@ ${geminiStyle}`;
             if ('type' in data) {
               if (data.type === 'meta') {
                 const meta = data as StreamMeta;
+                
+                // Convert webResults to SearchSource format and add them one by one with animation
+                if (meta.webResults && meta.webResults.length > 0) {
+                  // Extract domain from each URL using helper function
+                  const sourcesToAdd: SearchSource[] = meta.webResults.map((result, idx) => {
+                    const { domain, cleanUrl } = extractDomainFromUrl(result.link);
+                    
+                    return {
+                      id: `source-${idx}-${Date.now()}`,
+                      title: result.title,
+                      url: cleanUrl, // Use clean URL (original, not proxy)
+                      domain: domain,
+                    };
+                  });
+                  
+                  // Add sources one by one with animation delay
+                  sourcesToAdd.forEach((source, idx) => {
+                    setTimeout(() => {
+                      setSearchSources(prev => {
+                        // Avoid duplicates
+                        if (prev.some(s => s.url === source.url)) return prev;
+                        return [...prev, source];
+                      });
+                    }, idx * 100); // 100ms delay between each source
+                  });
+                  
+                  // Update step to show sources found
+                  setSearchSteps(prev => {
+                    const reviewingStep = prev.find(s => s.id === '3');
+                    if (reviewingStep) {
+                      return prev.map(s => 
+                        s.id === '3' 
+                          ? { ...s, text: `Found ${sourcesToAdd.length} sources`, status: 'complete' as const }
+                          : s
+                      );
+                    }
+                    return prev;
+                  });
+                }
+                
                 setChatHistory((prev) => {
                   const last = prev[prev.length - 1];
                   if (last?.role === 'model') {
                     return [
                       ...prev.slice(0, -1),
-                      { ...last, webResults: meta.webResults, lastUpdated: meta.lastUpdated, sources: undefined },
+                      { 
+                        ...last, 
+                        webResults: meta.webResults, 
+                        lastUpdated: meta.lastUpdated, 
+                        sources: undefined,
+                        sourceCount: meta.webResults?.length || 0
+                      },
                     ];
                   }
                   return prev;
@@ -635,6 +796,24 @@ ${geminiStyle}`;
               }
               if (data.type === 'token') {
                 fullText += (data as StreamChunk).text;
+                
+                // Update step to show writing when first token arrives
+                if (fullText.length === (data as StreamChunk).text.length) {
+                  setSearchSteps(prev => {
+                    const writingStep = prev.find(s => s.id === '4');
+                    if (writingStep && writingStep.status === 'pending') {
+                      return prev.map(s => 
+                        s.id === '4' 
+                          ? { ...s, status: 'active' as const, text: 'Writing answer...' }
+                          : s.id === '3' && s.status === 'active'
+                          ? { ...s, status: 'complete' as const, text: `Found ${searchSources.length} sources` }
+                          : s
+                      );
+                    }
+                    return prev;
+                  });
+                }
+                
                 setChatHistory((prev) => {
                   const last = prev[prev.length - 1];
                   if (last?.role === 'model') return [...prev.slice(0, -1), { ...last, text: fullText }];
@@ -659,12 +838,18 @@ ${geminiStyle}`;
       });
     } finally {
       setIsThinking(false);
-      setSearchSteps([]);
-      setSearchSources([]);
-      setCurrentSearchQuery('');
+      // Complete all steps when done
+      setSearchSteps(prev => prev.map(s => ({ ...s, status: 'complete' as const })));
+      // Keep sources visible, they'll be cleared when new search starts
+      setTimeout(() => {
+        setSearchSteps([]);
+        setSearchSources([]);
+        setCurrentSearchQuery('');
+      }, 2000); // Clear after 2 seconds
     }
   };
 
+  // Handle send text - defined after sendPrompt
   const handleSendText = async (customValue?: string) => {
     const userMessage = (customValue || inputValue).trim();
     if (!userMessage && !selectedImage) return;
@@ -721,7 +906,7 @@ ${geminiStyle}`;
         </div>
 
         <SidebarItem icon={<Home size={18} />} label="Home" onClick={() => setCurrentView('home')} isActive={currentView === 'home'} />
-        <SidebarItem icon={<Compass size={18} />} label="Discovery" onClick={handleOpenHistory} isActive={currentView === 'history'} />
+        <SidebarItem icon={<History size={18} />} label="History" onClick={handleOpenHistory} isActive={currentView === 'history'} />
         <SidebarItem icon={<Layers size={18} />} label="Spaces" onClick={handleOpenSpaces} isActive={currentView === 'spaces'} />
 
         <div className="mt-auto flex flex-col items-center">
@@ -845,7 +1030,28 @@ ${geminiStyle}`;
                             <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8e918f]">{msg.role === 'user' ? 'You' : 'Anything AI'}</span>
                           </div>
 
-                          <div className={`${msg.role === 'user' ? 'bg-[#4b90ff] text-black' : 'bg-[#1e1f20] text-[#e3e3e3]'} rounded-2xl p-4 border border-white/5 shadow-lg w-full relative`}>
+                            <div className={`${msg.role === 'user' ? 'bg-[#4b90ff] text-black' : 'bg-[#1e1f20] text-[#e3e3e3]'} rounded-2xl p-4 border border-white/5 shadow-lg w-full relative`}>
+                            
+                            {/* Reviewed Sources Indicator (Perplexity style) */}
+                            {msg.role === 'model' && msg.sourceCount && msg.sourceCount > 0 && (
+                              <div className="mb-4 pb-3 border-b border-white/10">
+                                <a 
+                                  href="#sources"
+                                  className="inline-flex items-center gap-2 text-xs text-[#8e918f] hover:text-[#4b90ff] transition-colors group"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    const sourcesSection = document.getElementById('sources-section');
+                                    sourcesSection?.scrollIntoView({ behavior: 'smooth' });
+                                  }}
+                                >
+                                  <span>Reviewed {msg.sourceCount} {msg.sourceCount === 1 ? 'source' : 'sources'}</span>
+                                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <path d="M5 12h14M12 5l7 7-7 7"/>
+                                  </svg>
+                                </a>
+                              </div>
+                            )}
+                            
                             {msg.image && (
                               <div className="max-w-sm rounded-xl overflow-hidden border border-white/10 mb-2">
                                 <img src={msg.image} alt="User Upload" className="w-full h-auto" />
@@ -904,30 +1110,41 @@ ${geminiStyle}`;
                                 )}
                                 <div className="space-y-2">
                                   {msg.webResults.map((r, i) => {
-                                    const content = (
-                                      <>
-                                        <div className="text-sm text-white">{r.title}</div>
-                                        {r.snippet && <div className="text-xs text-[#8e918f] mt-1">{r.snippet}</div>}
-                                        {r.link && <div className="text-[10px] text-[#4b90ff] mt-1 truncate">{r.link}</div>}
-                                      </>
-                                    );
-                                    return r.link ? (
+                                    // Extract clean domain name from URL
+                                    const { domain, cleanUrl } = extractDomainFromUrl(r.link);
+                                    
+                                    return (
                                       <a
                                         key={`${r.link}-${i}`}
-                                        href={r.link}
+                                        href={cleanUrl}
                                         target="_blank"
                                         rel="noopener noreferrer"
-                                        className="block p-2 rounded-lg border border-white/10 hover:border-[#4b90ff]/40 transition"
+                                        className="group flex items-start gap-3 p-3 rounded-xl border border-white/10 hover:border-[#4b90ff]/40 transition-all bg-[#1e1f20]/50 hover:bg-[#1e1f20]"
                                       >
-                                        {content}
+                                        <div className="w-8 h-8 rounded-lg bg-[#282a2c] flex items-center justify-center overflow-hidden shrink-0">
+                                          <img 
+                                            src={`https://www.google.com/s2/favicons?domain=${domain}&sz=32`}
+                                            alt={domain}
+                                            className="w-5 h-5"
+                                            onError={(e) => {
+                                              (e.target as HTMLImageElement).src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%234b90ff"><circle cx="12" cy="12" r="10"/></svg>';
+                                            }}
+                                          />
+                                        </div>
+                                        <div className="flex-1 min-w-0">
+                                          <div className="text-[10px] font-semibold text-[#4b90ff] mb-1 uppercase tracking-wider truncate">
+                                            {domain}
+                                          </div>
+                                          <div className="text-sm text-white group-hover:text-[#4b90ff] transition-colors line-clamp-2">
+                                            {r.title}
+                                          </div>
+                                          {r.snippet && (
+                                            <div className="text-xs text-[#8e918f] mt-1 line-clamp-1">
+                                              {r.snippet}
+                                            </div>
+                                          )}
+                                        </div>
                                       </a>
-                                    ) : (
-                                      <div
-                                        key={`no-link-${i}`}
-                                        className="block p-2 rounded-lg border border-white/10"
-                                      >
-                                        {content}
-                                      </div>
                                     );
                                   })}
                                 </div>
@@ -946,30 +1163,35 @@ ${geminiStyle}`;
                                 </p>
                                 <div className="flex gap-3 overflow-x-auto pb-2 no-scrollbar">
                                   {msg.webResults.map((source, i) => {
-                                    const domain = source.link ? new URL(source.link).hostname.replace('www.', '') : 'source';
+                                    // Extract clean domain name from URL
+                                    const { domain, cleanUrl } = extractDomainFromUrl(source.link);
+                                    
                                     return (
-                                    <a
-                                      key={`${source.link}-${i}`}
-                                      href={source.link}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="group flex items-start gap-3 p-3 bg-[#1e1f20] border border-white/5 rounded-xl hover:border-[#4b90ff]/30 transition-all cursor-pointer min-w-[240px] max-w-[280px]"
-                                    >
-                                      <div className="w-6 h-6 rounded-lg bg-[#282a2c] flex items-center justify-center overflow-hidden shrink-0">
-                                        <img 
-                                        src={`https://www.google.com/s2/favicons?domain=${domain}&sz=32`}
-                                          alt="" 
-                                          className="w-4 h-4"
-                                        />
-                                      </div>
-                                      <div className="flex-1 min-w-0">
-                                        <p className="text-[10px] text-[#4b90ff] mb-0.5 truncate">{domain}</p>
-                                        <p className="text-xs text-[#8e918f] line-clamp-2 group-hover:text-white transition-colors">
-                                          {source.title}
-                                        </p>
-                                      </div>
-                                    </a>
-                                  );
+                                      <a
+                                        key={`${source.link}-${i}`}
+                                        href={cleanUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="group flex items-start gap-3 p-3 bg-[#1e1f20] border border-white/5 rounded-xl hover:border-[#4b90ff]/30 transition-all cursor-pointer min-w-[240px] max-w-[280px]"
+                                      >
+                                        <div className="w-8 h-8 rounded-lg bg-[#282a2c] flex items-center justify-center overflow-hidden shrink-0">
+                                          <img 
+                                            src={`https://www.google.com/s2/favicons?domain=${domain}&sz=32`}
+                                            alt={domain}
+                                            className="w-5 h-5"
+                                            onError={(e) => {
+                                              (e.target as HTMLImageElement).src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%234b90ff"><circle cx="12" cy="12" r="10"/></svg>';
+                                            }}
+                                          />
+                                        </div>
+                                        <div className="flex-1 min-w-0">
+                                          <p className="text-[10px] font-semibold text-[#4b90ff] mb-1 uppercase tracking-wider truncate">{domain}</p>
+                                          <p className="text-xs text-[#8e918f] line-clamp-2 group-hover:text-white transition-colors">
+                                            {source.title}
+                                          </p>
+                                        </div>
+                                      </a>
+                                    );
                                   })}
                                 </div>
                               </div>
@@ -977,7 +1199,7 @@ ${geminiStyle}`;
 
                             <div className={`${msg.role === 'user' ? 'text-black' : 'text-[#e3e3e3]'}`}>
                               {msg.role === 'model' ? (
-                                <MarkdownRenderer content={msg.text} />
+                                <MarkdownRenderer content={msg.text} webResults={msg.webResults} />
                               ) : (
                                 <div className="whitespace-pre-wrap text-lg leading-relaxed">{msg.text}</div>
                               )}
@@ -1008,26 +1230,14 @@ ${geminiStyle}`;
                       </div>
                     ))}
                     
-                    {/* Search Animation */}
-                    {isThinking && searchSteps.length > 0 && (
+                    {/* Search Animation - Shows visual progress with sources appearing one by one */}
+                    {(isThinking || searchSteps.length > 0 || searchSources.length > 0) && (
                       <SearchAnimation
-                        isSearching={isThinking}
+                        isSearching={isThinking || searchSources.length > 0}
                         steps={searchSteps}
                         sources={searchSources}
                         query={currentSearchQuery}
                       />
-                    )}
-
-                    {/* Typing Indicator */}
-                    {isThinking && (
-                      <div className="flex items-center gap-2 text-xs text-[#8e918f]">
-                        <div className="flex gap-1">
-                          <span className="w-2 h-2 bg-[#4b90ff] rounded-full animate-pulse"></span>
-                          <span className="w-2 h-2 bg-[#4b90ff] rounded-full animate-pulse [animation-delay:150ms]"></span>
-                          <span className="w-2 h-2 bg-[#4b90ff] rounded-full animate-pulse [animation-delay:300ms]"></span>
-                        </div>
-                        AI is thinking...
-                      </div>
                     )}
                     
                     <div ref={chatEndRef} />
@@ -1080,6 +1290,93 @@ ${geminiStyle}`;
                     </button>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {currentView === 'history' && (
+              <div className="animate-in fade-in slide-in-from-bottom-6 duration-700 mt-8">
+                <h2 className="text-4xl font-bold mb-10 text-white tracking-tight">Chat History</h2>
+                
+                {sessions.length === 0 ? (
+                  <div className="text-center py-20">
+                    <History size={48} className="mx-auto mb-4 text-[#8e918f]" />
+                    <p className="text-[#8e918f] text-lg">No chat history yet</p>
+                    <p className="text-[#444746] text-sm mt-2">Start a conversation to see your history here</p>
+                  </div>
+                ) : (
+                  <div className="space-y-8">
+                    {spacesList.map(space => {
+                      const spaceSessions = sessions
+                        .filter(s => s.spaceId === space.id)
+                        .sort((a, b) => b.lastUpdated - a.lastUpdated);
+                      
+                      if (spaceSessions.length === 0) return null;
+                      
+                      return (
+                        <div key={space.id} className="space-y-4">
+                          <div className="flex items-center gap-3 mb-4">
+                            <span className="text-2xl">{space.icon}</span>
+                            <h3 className="text-2xl font-bold text-white">{space.name}</h3>
+                            <span className="text-sm text-[#8e918f]">({spaceSessions.length} {spaceSessions.length === 1 ? 'chat' : 'chats'})</span>
+                          </div>
+                          
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                            {spaceSessions.map(session => (
+                              <button
+                                key={session.id}
+                                onClick={() => resumeSession(session)}
+                                className="group p-6 bg-[#1e1f20] border border-white/5 rounded-2xl text-left transition-all hover:border-[#4b90ff]/50 hover:bg-[#282a2c]"
+                              >
+                                <div className="flex items-start justify-between mb-3">
+                                  <div className="flex-1 min-w-0">
+                                    <h4 className="text-sm font-semibold text-white group-hover:text-[#4b90ff] transition-colors truncate mb-1">
+                                      {session.title || 'New Chat'}
+                                    </h4>
+                                    <p className="text-[10px] text-[#8e918f]">
+                                      {new Date(session.lastUpdated).toLocaleDateString([], { 
+                                        month: 'short', 
+                                        day: 'numeric',
+                                        year: session.lastUpdated > Date.now() - 31536000000 ? undefined : 'numeric'
+                                      })}
+                                      {' • '}
+                                      {new Date(session.lastUpdated).toLocaleTimeString([], { 
+                                        hour: '2-digit', 
+                                        minute: '2-digit' 
+                                      })}
+                                    </p>
+                                  </div>
+                                  <div 
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      deleteSession(e as any, session.id);
+                                    }}
+                                    className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 transition-all"
+                                  >
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                      <path d="M18 6L6 18M6 6l12 12"/>
+                                    </svg>
+                                  </div>
+                                </div>
+                                
+                                {session.messages.length > 0 && (
+                                  <div className="text-xs text-[#8e918f] line-clamp-2 mt-2">
+                                    {session.messages[session.messages.length - 1]?.role === 'user' 
+                                      ? session.messages[session.messages.length - 1]?.text
+                                      : session.messages.find(m => m.role === 'user')?.text || 'Chat started'}
+                                  </div>
+                                )}
+                                
+                                <div className="mt-3 flex items-center gap-2 text-[10px] text-[#4b90ff]">
+                                  <span>{session.messages.length} {session.messages.length === 1 ? 'message' : 'messages'}</span>
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1145,8 +1442,8 @@ ${geminiStyle}`;
           <span className="text-[10px] mt-1">Home</span>
         </button>
         <button onClick={handleOpenHistory} className="flex flex-col items-center text-[#8e918f]">
-          <Compass size={18} />
-          <span className="text-[10px] mt-1">Discovery</span>
+          <History size={18} />
+          <span className="text-[10px] mt-1">History</span>
         </button>
         <button onClick={handleOpenSpaces} className="flex flex-col items-center text-[#8e918f]">
           <Layers size={18} />
@@ -1173,3 +1470,4 @@ ${geminiStyle}`;
 };
 
 export default App;
+

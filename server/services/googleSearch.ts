@@ -192,7 +192,24 @@ export async function performWebSearch(query: string): Promise<GoogleSearchResul
           if (chunk.web?.uri) {
             // Try to extract snippet from the text content if available
             const title = chunk.web.title || 'Untitled';
-            const link = chunk.web.uri;
+            let link = chunk.web.uri;
+            
+            // Extract original URL from Vertex AI Search proxy URLs
+            // Vertex AI Search URLs format: https://vertexaisearch.cloud.google.com/redirect?url=ORIGINAL_URL
+            if (link.includes('vertexaisearch.cloud.google.com')) {
+              try {
+                const urlObj = new URL(link);
+                const originalUrl = urlObj.searchParams.get('url');
+                if (originalUrl) {
+                  // Decode the original URL
+                  link = decodeURIComponent(originalUrl);
+                  console.log('[googleSearch] Extracted original URL from proxy:', link);
+                }
+              } catch (e) {
+                console.warn('[googleSearch] Failed to extract original URL from proxy:', e);
+                // Keep the proxy URL if extraction fails
+              }
+            }
             
             // Try to find relevant snippet from extracted text or use title
             const snippet = extractedText 

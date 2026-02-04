@@ -285,17 +285,37 @@ export async function* streamGenerateContent(
 
 Web search results for: "${payload.message}"\n\n` +
       web.results
-        .map((r, i) => `${i + 1}. ${r.title}\n   ${r.link}\n   ${r.snippet || ''}`)
+        .map((r, i) => {
+          // Extract domain for citation
+          let domain = 'source';
+          try {
+            const url = new URL(r.link);
+            if (url.hostname.includes('vertexaisearch')) {
+              const originalUrl = url.searchParams.get('url');
+              if (originalUrl) {
+                domain = new URL(decodeURIComponent(originalUrl)).hostname.replace('www.', '').split('.')[0];
+              }
+            } else {
+              domain = url.hostname.replace('www.', '').split('.')[0];
+            }
+          } catch {}
+          
+          return `${i + 1}. ${r.title} [source: ${domain}]\n   ${r.link}\n   ${r.snippet || ''}`;
+        })
         .join('\n\n') +
       `\n\nCRITICAL INSTRUCTIONS:
 - Extract the key information from the above search results
 - Present this information directly in your answer
-- Structure your response with clear sections if there are multiple topics
+- Structure your response with clear BOLD headings and bullet points (like Perplexity AI)
 - Include specific details, facts, and data from the sources
-- Cite sources naturally within your response (e.g., "According to [source]...")
+- **CITE SOURCES INLINE** - After each fact or sentence, add [source: domainname] citation
+  Example: "India won the match. [source: ndtv]"
+  Example: "New policy announced. [source: indianexpress]"
+- For YouTube sources, use: [source: youtube] or show ►YouTube
 - DO NOT say "I cannot provide" or "check these sources" - YOU must provide the answer
-- For trending topics, list the actual trends with details from the sources
-- Be comprehensive and informative, like Perplexity AI`
+- For trending topics, list actual trending topics with details and cite each one inline
+- Be comprehensive and informative, like Perplexity AI
+- Format: Use **Bold Headings**, bullet points (-), and inline source badges after each fact`
     : undefined;
   const contents = await buildContents(payload, webContext);
 
@@ -312,25 +332,46 @@ Web search results for: "${payload.message}"\n\n` +
   let updatedSystemInstruction = payload.systemInstruction || '';
   
   if (web && web.results.length > 0) {
+    // Create domain list for citation
+    const domains = web.results.map(r => {
+      try {
+        const url = new URL(r.link);
+        if (url.hostname.includes('vertexaisearch')) {
+          const originalUrl = url.searchParams.get('url');
+          if (originalUrl) {
+            return new URL(decodeURIComponent(originalUrl)).hostname.replace('www.', '').split('.')[0];
+          }
+        }
+        return url.hostname.replace('www.', '').split('.')[0];
+      } catch {
+        return 'source';
+      }
+    }).filter((d, i, arr) => arr.indexOf(d) === i); // Unique domains
+    
     const webInstruction = isNewQuestion
       ? `\n\nCRITICAL: Web search results have been provided. You MUST:
 1. Extract and present the actual information from the search results
 2. Answer the question directly using the information from the sources
-3. Structure your response clearly (use sections, bullet points, etc.)
+3. Structure your response clearly with headings and bullet points (like Perplexity AI)
 4. Include specific details, facts, and data from the sources
-5. Cite sources naturally (e.g., "According to [source name]...")
-6. DO NOT give disclaimers like "I cannot provide" or "check these sources"
-7. DO NOT apologize or say you don't have access - you have the search results
-8. For "trending" queries, list the actual trending topics with details
-9. Be comprehensive and informative - extract all relevant information
-10. Only mention "Last updated" if truly time-sensitive (breaking news)
+5. **CITE SOURCES INLINE** - After each fact or sentence, add source citation in format: [source: domainname]
+   Example: "India won the match against Australia. [source: ndtv]"
+   Available sources: ${domains.join(', ')}
+6. For YouTube sources, use: [source: youtube] or show ►YouTube badge
+7. DO NOT give disclaimers like "I cannot provide" or "check these sources"
+8. DO NOT apologize or say you don't have access - you have the search results
+9. For "trending" queries, list actual trending topics with details and cite each one
+10. Be comprehensive - extract all relevant information and cite sources for each fact
+11. Format like Perplexity: Use bold headings, bullet points, and inline source badges
 
-Example for "what's trending today":
-- Extract the actual trending topics from the sources
-- List them with details: "1. [Topic] - [details from sources]"
-- Include specific information, not just general suggestions
-- Cite sources naturally within the content`
-      : `\n\nWeb search results are available. Extract and present the actual information from these sources. Do not give disclaimers - provide the answer using the search results.`;
+Example format:
+**Political Updates**
+- Major policy announcement in Delhi. [source: indianexpress]
+- Supreme Court ruling on privacy. [source: ndtv]
+
+**Infrastructure**
+- New metro line opened. [source: economictimes]`
+      : `\n\nWeb search results are available. Extract and present the actual information from these sources. Cite sources inline using [source: domainname] format after each fact. Available sources: ${domains.join(', ')}`;
     
     updatedSystemInstruction = `${updatedSystemInstruction}${webInstruction}`;
   } else if (isNewQuestion) {

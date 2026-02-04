@@ -123,6 +123,9 @@ const SourceCard: React.FC<{ source: SearchSource; index: number }> = ({ source,
     return `https://www.google.com/s2/favicons?domain=${domain}&sz=32`;
   };
 
+  // Check if it's YouTube
+  const isYouTube = source.domain.toLowerCase().includes('youtube') || source.domain.toLowerCase().includes('youtu.be');
+
   return (
     <motion.a
       href={source.url}
@@ -138,21 +141,27 @@ const SourceCard: React.FC<{ source: SearchSource; index: number }> = ({ source,
         damping: 20
       }}
       whileHover={{ scale: 1.02, y: -2 }}
-      className="group flex items-start gap-3 p-4 bg-[#1e1f20] border border-white/5 rounded-2xl hover:border-[#4b90ff]/30 hover:shadow-[0_0_20px_rgba(75,144,255,0.1)] transition-all cursor-pointer min-w-[280px] max-w-[320px]"
+      className="group flex items-start gap-3 p-3 bg-[#1e1f20] border border-white/5 rounded-xl hover:border-[#4b90ff]/30 hover:shadow-[0_0_20px_rgba(75,144,255,0.1)] transition-all cursor-pointer min-w-[260px] max-w-[300px]"
     >
-      <div className="w-8 h-8 rounded-lg bg-[#282a2c] flex items-center justify-center overflow-hidden shrink-0">
-        <img 
-          src={source.favicon || getFaviconUrl(source.domain)} 
-          alt="" 
-          className="w-5 h-5"
-          onError={(e) => {
-            (e.target as HTMLImageElement).src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%234b90ff"><circle cx="12" cy="12" r="10"/></svg>';
-          }}
-        />
+      <div className="w-7 h-7 rounded-lg bg-[#282a2c] flex items-center justify-center overflow-hidden shrink-0">
+        {isYouTube ? (
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="#FF0000">
+            <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
+          </svg>
+        ) : (
+          <img 
+            src={source.favicon || getFaviconUrl(source.domain)} 
+            alt="" 
+            className="w-5 h-5"
+            onError={(e) => {
+              (e.target as HTMLImageElement).src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%234b90ff"><circle cx="12" cy="12" r="10"/></svg>';
+            }}
+          />
+        )}
       </div>
       <div className="flex-1 min-w-0">
-        <p className="text-xs text-[#4b90ff] mb-1 truncate">{source.domain}</p>
-        <p className="text-sm text-[#e3e3e3] line-clamp-2 group-hover:text-white transition-colors">
+        <p className="text-xs text-[#4b90ff] mb-0.5 truncate font-medium">{source.domain}</p>
+        <p className="text-xs text-[#e3e3e3] line-clamp-2 group-hover:text-white transition-colors leading-relaxed">
           {source.title}
         </p>
       </div>
@@ -178,7 +187,7 @@ export const SourceGrid: React.FC<{ sources: SearchSource[]; isVisible: boolean 
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
           <polyline points="14 2 14 8 20 8"/>
         </svg>
-        Reviewing sources
+        Reviewing sources ({sources.length})
       </motion.p>
       
       <div className="flex gap-3 overflow-x-auto pb-2 no-scrollbar">
@@ -220,10 +229,15 @@ const SearchAnimation: React.FC<SearchAnimationProps> = ({
           </svg>
         </motion.div>
         <div>
-          <h3 className="text-lg font-semibold text-white">Thinking</h3>
+          <h3 className="text-lg font-semibold text-white">
+            {sources.length > 0 ? 'Researching & Writing' : 'Thinking'}
+          </h3>
           {query && (
             <p className="text-sm text-[#8e918f] mt-0.5">
-              Researching: {query.length > 50 ? query.slice(0, 50) + '...' : query}
+              {sources.length > 0 
+                ? `Found ${sources.length} sources • Writing answer...`
+                : `Researching: ${query.length > 50 ? query.slice(0, 50) + '...' : query}`
+              }
             </p>
           )}
         </div>
