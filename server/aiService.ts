@@ -3,12 +3,11 @@
  * Uses @google/genai generateContentStream and countTokens.
  */
 
-import { GoogleGenAI, FunctionCallingConfigMode } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 import { logUsage } from './utils/usageLogger';
 import { isRateLimitError } from './utils/errorHandler';
 import { getWeatherContext } from './utils/weatherService';
 import { getTimeContext } from './utils/timeService';
-import { googleSearchTool } from './utils/geminiTools';
 import { performWebSearch, type GoogleSearchResult } from './services/googleSearch';
 
 const MAX_RETRIES = 4;
@@ -51,6 +50,33 @@ function getApiKey(): string {
 }
 
 /**
+ * Detect if current message is a follow-up or a new question
+ */
+function isFollowUpQuestion(currentMessage: string, history: Array<{ role: 'user' | 'model'; text: string }>): boolean {
+  if (!history || history.length === 0) return false;
+  
+  const lowerMessage = currentMessage.toLowerCase().trim();
+  const followUpIndicators = [
+    'what about', 'and', 'also', 'tell me more', 'explain', 'how about',
+    'what if', 'can you', 'could you', 'please', 'yes', 'no', 'ok',
+    'thanks', 'thank you', 'that', 'this', 'it', 'they', 'he', 'she'
+  ];
+  
+  // Check if message starts with follow-up indicators
+  const startsWithFollowUp = followUpIndicators.some(indicator => 
+    lowerMessage.startsWith(indicator)
+  );
+  
+  // Check if message is very short (likely a follow-up)
+  const isShortFollowUp = lowerMessage.length < 20 && (
+    lowerMessage.includes('?') || 
+    followUpIndicators.some(ind => lowerMessage.includes(ind))
+  );
+  
+  return startsWithFollowUp || isShortFollowUp;
+}
+
+/**
  * Build contents for Gemini: string for single turn (no history, no image), else array of Content.
  */
 async function buildContents(payload: StreamChatPayload, webContext?: string): Promise<unknown> {
@@ -58,14 +84,21 @@ async function buildContents(payload: StreamChatPayload, webContext?: string): P
   const hasImage = !!(payload.imageBase64 && payload.mimeType);
   const weatherContext = await getWeatherContext(payload.message);
   const timeContext = getTimeContext(payload.message);
+  
+  // Check if this is a new question vs follow-up
+  const isFollowUp = hasHistory ? isFollowUpQuestion(payload.message, payload.history!) : false;
 
   if (!hasHistory && !hasImage && !weatherContext && !timeContext && !webContext) {
     return payload.message;
   }
 
   const contents: unknown[] = [];
-  if (hasHistory) {
-    for (const turn of payload.history!) {
+  // Only include history if it's a follow-up question or explicitly needed
+  // For completely new questions, don't include previous context to avoid confusion
+  if (hasHistory && (isFollowUp || payload.history!.length <= 2)) {
+    // Limit history to last 2-3 exchanges to avoid carrying over too much context
+    const recentHistory = payload.history!.slice(-4); // Last 2 user-model pairs
+    for (const turn of recentHistory) {
       contents.push({
         role: turn.role === 'user' ? 'user' : 'model',
         parts: [{ text: turn.text }],
@@ -108,35 +141,98 @@ async function buildContents(payload: StreamChatPayload, webContext?: string): P
   return contents;
 }
 
+/**
+ * Generate multiple search query variations to get more comprehensive results
+ * Similar to how Perplexity AI makes multiple searches
+ */
+function generateSearchQueryVariations(query: string): string[] {
+  const queries: string[] = [query]; // Original query
+  
+  // Add variations for better coverage
+  const lowerQuery = query.toLowerCase();
+  
+  // For trending queries, add time-specific variations
+  if (lowerQuery.includes('trending') || lowerQuery.includes('latest') || lowerQuery.includes('today')) {
+    queries.push(`${query} February 2026`);
+    queries.push(`${query} current events`);
+    queries.push(`${query} news`);
+  }
+  
+  // For general queries, add context variations
+  if (!lowerQuery.includes('trending') && !lowerQuery.includes('latest')) {
+    queries.push(`${query} 2026`);
+    queries.push(`${query} recent`);
+  }
+  
+  // Limit to 3-4 queries to avoid too many API calls
+  return queries.slice(0, 4);
+}
+
 async function maybeGetWebResults(
   ai: GoogleGenAI,
   model: string,
   message: string
 ): Promise<{ results: GoogleSearchResult[]; lastUpdated: string } | null> {
-  const response = await ai.models.generateContent({
-    model,
-    contents: message,
-    config: {
-      tools: [{ functionDeclarations: [googleSearchTool] }],
-      toolConfig: {
-        functionCallingConfig: {
-          mode: FunctionCallingConfigMode.ANY,
-          allowedFunctionNames: ['google_search'],
-        },
-      },
-      systemInstruction:
-        'Always call google_search for every user query. Use a short, precise search query.',
-    },
-  });
-
-  const call = response.functionCalls?.[0];
-  if (!call || call.name !== 'google_search') {
-    return { results: [{ title: 'Search unavailable', link: '', snippet: 'Model did not call google_search.' }], lastUpdated: new Date().toISOString() };
+  const query = message.trim();
+  
+  if (!query) {
+    return null;
   }
-  const query = (call.args?.query as string | undefined)?.trim() || message;
 
-  const results = await performWebSearch(query);
-  return { results, lastUpdated: new Date().toISOString() };
+  try {
+    // Generate multiple query variations for comprehensive results (like Perplexity)
+    const queryVariations = generateSearchQueryVariations(query);
+    
+    console.log('[aiService] Generated search query variations:', queryVariations);
+    
+    // Execute searches with small delays to avoid rate limits
+    // Perplexity AI uses this strategy to get comprehensive results
+    const allResults: GoogleSearchResult[][] = [];
+    for (let i = 0; i < queryVariations.length; i++) {
+      const results = await performWebSearch(queryVariations[i]);
+      allResults.push(results);
+      // Small delay between searches to avoid rate limiting (except for last one)
+      if (i < queryVariations.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 200)); // 200ms delay
+      }
+    }
+    
+    // Aggregate and deduplicate results
+    const aggregatedResults: GoogleSearchResult[] = [];
+    const seenUrls = new Set<string>();
+    
+    for (const results of allResults) {
+      for (const result of results) {
+        // Normalize URL to avoid duplicates (remove trailing slashes, query params, etc.)
+        const normalizedUrl = result.link
+          .replace(/\/$/, '') // Remove trailing slash
+          .split('?')[0] // Remove query parameters
+          .toLowerCase();
+        
+        if (!seenUrls.has(normalizedUrl) && result.link) {
+          seenUrls.add(normalizedUrl);
+          aggregatedResults.push(result);
+        }
+      }
+    }
+    
+    // Sort by relevance (prioritize results with titles and snippets)
+    aggregatedResults.sort((a, b) => {
+      const aScore = (a.title ? 1 : 0) + (a.snippet ? 1 : 0);
+      const bScore = (b.title ? 1 : 0) + (b.snippet ? 1 : 0);
+      return bScore - aScore;
+    });
+    
+    // Limit to top 15-20 results (similar to Perplexity)
+    const finalResults = aggregatedResults.slice(0, 20);
+    
+    console.log('[aiService] Aggregated search results:', finalResults.length, 'from', queryVariations.length, 'queries');
+    
+    return { results: finalResults, lastUpdated: new Date().toISOString() };
+  } catch (error) {
+    console.error('[aiService] Web search error:', error);
+    return null;
+  }
 }
 
 /**
@@ -182,11 +278,24 @@ export async function* streamGenerateContent(
   const apiKey = getApiKey();
   const ai = new GoogleGenAI({ apiKey });
   const web = await maybeGetWebResults(ai, model, payload.message);
-  const webContext = web
-    ? `Realtime web results (Last updated: ${web.lastUpdated}):\n` +
+  
+  // Format web context more naturally - only include if results exist
+  const webContext = web && web.results.length > 0
+    ? `IMPORTANT: Web search results have been retrieved for the user's query. You MUST extract and present the actual information from these sources in your response. Do NOT give disclaimers or suggest the user check the sources themselves - YOU must provide the answer using this information.
+
+Web search results for: "${payload.message}"\n\n` +
       web.results
-        .map((r, i) => `${i + 1}. ${r.title}\n${r.link}\n${r.snippet}`)
-        .join('\n\n')
+        .map((r, i) => `${i + 1}. ${r.title}\n   ${r.link}\n   ${r.snippet || ''}`)
+        .join('\n\n') +
+      `\n\nCRITICAL INSTRUCTIONS:
+- Extract the key information from the above search results
+- Present this information directly in your answer
+- Structure your response with clear sections if there are multiple topics
+- Include specific details, facts, and data from the sources
+- Cite sources naturally within your response (e.g., "According to [source]...")
+- DO NOT say "I cannot provide" or "check these sources" - YOU must provide the answer
+- For trending topics, list the actual trends with details from the sources
+- Be comprehensive and informative, like Perplexity AI`
     : undefined;
   const contents = await buildContents(payload, webContext);
 
@@ -194,9 +303,40 @@ export async function* streamGenerateContent(
     yield { type: 'meta', webResults: web.results, lastUpdated: web.lastUpdated };
   }
 
-  const updatedSystemInstruction = web
-    ? `${payload.systemInstruction || ''}\n\nUse the realtime web results if provided and end the response with "Last updated: ${web.lastUpdated}".`
-    : payload.systemInstruction;
+  // Detect if this is a new question (not a follow-up)
+  const isNewQuestion = !payload.history || payload.history.length === 0 || 
+    !isFollowUpQuestion(payload.message, payload.history || []);
+  
+  // Only add web search instruction if web results are available
+  // Make it clear this is a new question if applicable
+  let updatedSystemInstruction = payload.systemInstruction || '';
+  
+  if (web && web.results.length > 0) {
+    const webInstruction = isNewQuestion
+      ? `\n\nCRITICAL: Web search results have been provided. You MUST:
+1. Extract and present the actual information from the search results
+2. Answer the question directly using the information from the sources
+3. Structure your response clearly (use sections, bullet points, etc.)
+4. Include specific details, facts, and data from the sources
+5. Cite sources naturally (e.g., "According to [source name]...")
+6. DO NOT give disclaimers like "I cannot provide" or "check these sources"
+7. DO NOT apologize or say you don't have access - you have the search results
+8. For "trending" queries, list the actual trending topics with details
+9. Be comprehensive and informative - extract all relevant information
+10. Only mention "Last updated" if truly time-sensitive (breaking news)
+
+Example for "what's trending today":
+- Extract the actual trending topics from the sources
+- List them with details: "1. [Topic] - [details from sources]"
+- Include specific information, not just general suggestions
+- Cite sources naturally within the content`
+      : `\n\nWeb search results are available. Extract and present the actual information from these sources. Do not give disclaimers - provide the answer using the search results.`;
+    
+    updatedSystemInstruction = `${updatedSystemInstruction}${webInstruction}`;
+  } else if (isNewQuestion) {
+    // For new questions without web results, emphasize independence
+    updatedSystemInstruction = `${updatedSystemInstruction}\n\nThis is a NEW question. Answer it directly and independently. Don't reference previous conversation unless explicitly relevant.`;
+  }
 
   const streamParams = {
     model,
