@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { Copy, Check, RefreshCw, Loader2, Home, History, Layers, User, Settings } from 'lucide-react';
+import { Copy, Check, RefreshCw, Loader2, Home, History, Layers, User, Settings, LogOut } from 'lucide-react';
 import { motion } from 'framer-motion';
 import SearchAnimation, { SearchStep, SearchSource } from './components/SearchAnimation';
 
@@ -12,8 +12,9 @@ import SearchAnimation, { SearchStep, SearchSource } from './components/SearchAn
 type StreamChunk = { type: 'token'; text: string };
 type StreamMeta = { type: 'meta'; webResults?: WebResult[]; lastUpdated?: string };
 type StreamDone = { type: 'done'; usage?: { inputTokens: number; outputTokens: number } };
+type StreamConversation = { type: 'conversation'; conversationId: string; title?: string };
 type StreamError = { error: true; code: string; message: string };
-type StreamEvent = StreamChunk | StreamMeta | StreamDone | StreamError;
+type StreamEvent = StreamChunk | StreamMeta | StreamDone | StreamConversation | StreamError;
 
 type WeatherData = {
   location: string;
@@ -42,6 +43,38 @@ type WebResult = {
   link: string;
   snippet?: string;
 };
+
+// --- Auth & API types ---
+const AUTH_TOKEN_KEY = 'anything_ai_token';
+const AUTH_USER_KEY = 'anything_ai_user';
+
+interface AuthUser {
+  id: string;
+  email: string;
+  departmentId: string;
+  departmentName: string | null;
+}
+
+interface ApiDepartment {
+  id: string;
+  name: string;
+  icon?: string;
+  description?: string;
+}
+
+interface ApiConversation {
+  id: string;
+  title: string;
+  updatedAt: string;
+  departmentId?: string;
+  pinned?: boolean;
+}
+
+interface ApiMessage {
+  role: 'user' | 'model';
+  text: string;
+  createdAt?: string;
+}
 
 // --- Types ---
 interface Space {
@@ -73,6 +106,37 @@ interface ChatSession {
 
 // --- API base: empty locally (Vite proxy), set to Render URL in production (Vercel) ---
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');
+
+// Default spaces shown on landing (before login); seed these via npm run seed:departments
+const DEFAULT_SPACES: Space[] = [
+  { id: '0', name: 'Ask Anything', icon: '💬', description: 'Ask me anything - I respond perfectly to any query with accurate, helpful answers.' },
+  { id: '1', name: 'Gen. AI Team', icon: '🧠', description: 'Expert systems for advanced logic and R&D.' },
+  { id: '1-sub', name: 'Create Prompts', icon: '✍️', description: 'Specialized Prompt Engineering space.' },
+  { id: '2', name: 'Creative Studio', icon: '🎨', description: 'Visual storytelling and asset generation.' },
+  { id: '3', name: 'Personal Research', icon: '📚', description: 'Deep data synthesis and knowledge extraction.' },
+  { id: '4', name: 'Contenaissance Branding', icon: '✨', description: 'Real-time viral content strategies.' },
+  { id: '5', name: 'Content Writer Team', icon: '📝', description: 'SEO-optimized articles and copywriting.' },
+];
+
+// --- Animated title (character-by-character, GPT-style) ---
+const AnimatedTitle = ({ text, className = '' }: { text: string; className?: string }) => {
+  const chars = text.split('');
+  return (
+    <span className={`inline-block truncate ${className}`}>
+      {chars.map((char, i) => (
+        <motion.span
+          key={`${i}-${char}`}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ duration: 0.15, delay: i * 0.03 }}
+          className="inline-block"
+        >
+          {char}
+        </motion.span>
+      ))}
+    </span>
+  );
+};
 
 // --- Utilities ---
 const generateId = () => Math.random().toString(36).substr(2, 9);
@@ -122,22 +186,59 @@ const extractDomainFromUrl = (url: string): { domain: string; cleanUrl: string }
 };
 
 const App = () => {
+  // Auth state (global)
+  const [auth, setAuth] = useState<{
+    token: string | null;
+    user: AuthUser | null;
+    isAuthenticated: boolean;
+  }>(() => {
+    const token = localStorage.getItem(AUTH_TOKEN_KEY);
+    const userJson = localStorage.getItem(AUTH_USER_KEY);
+    const user = userJson ? (JSON.parse(userJson) as AuthUser) : null;
+    return { token, user, isAuthenticated: !!token && !!user };
+  });
+
+  // Department state: active department, access codes for cross-department
+  const [activeDepartmentId, setActiveDepartmentId] = useState<string | null>(null);
+  const [accessCodeMap, setAccessCodeMap] = useState<Record<string, string>>({});
+  const [departmentAccessError, setDepartmentAccessError] = useState<string | null>(null);
+
+  // Chat state: backend conversation id, conversations list for sidebar
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [conversationsList, setConversationsList] = useState<ApiConversation[]>([]);
+  const [conversationsRefreshTrigger, setConversationsRefreshTrigger] = useState(0);
+  const [allConversationsList, setAllConversationsList] = useState<ApiConversation[]>([]);
+  const [pendingConversationTitle, setPendingConversationTitle] = useState<string | null>(null);
+  const [conversationMenuOpen, setConversationMenuOpen] = useState<string | null>(null);
+  const [renameModalConv, setRenameModalConv] = useState<ApiConversation | null>(null);
+  const [renameInput, setRenameInput] = useState('');
+  const conversationMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // Modals
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [accessCodeModalDept, setAccessCodeModalDept] = useState<Space | null>(null);
+  const [accessCodeInput, setAccessCodeInput] = useState(['', '', '', '']);
+  const [accessCodeChecking, setAccessCodeChecking] = useState(false);
+
+  // Auth form state (for modal)
+  const [authIsRegister, setAuthIsRegister] = useState(false);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authDepartmentName, setAuthDepartmentName] = useState('');
+  const [authDepartmentsForDropdown, setAuthDepartmentsForDropdown] = useState<ApiDepartment[]>([]);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authSuccessLoading, setAuthSuccessLoading] = useState(false); // 2s loader after sign in/register
+  const [authError, setAuthError] = useState('');
+
   // Navigation State
-  const [currentView, setCurrentView] = useState<'home' | 'chat' | 'spaces' | 'select-space' | 'history'>('home');
+  const [currentView, setCurrentView] = useState<'home' | 'chat' | 'spaces' | 'select-space' | 'history' | 'profile'>('home');
   const [activeSpace, setActiveSpace] = useState<Space | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [isSpaceSidebarOpen, setIsSpaceSidebarOpen] = useState(true);
-  
-  // Spaces List with specialized configurations
-  const [spacesList] = useState<Space[]>([
-    { id: '0', name: 'Ask Anything', icon: '💬', description: 'Ask me anything - I respond perfectly to any query with accurate, helpful answers.' },
-    { id: '1', name: 'Gen. AI Team', icon: '🧠', description: 'Expert systems for advanced logic and R&D.' },
-    { id: '1-sub', name: 'Create Prompts', icon: '✍️', description: 'Specialized Prompt Engineering space.' },
-    { id: '2', name: 'Creative Studio', icon: '🎨', description: 'Visual storytelling and asset generation.' },
-    { id: '3', name: 'Personal Research', icon: '📚', description: 'Deep data synthesis and knowledge extraction.' },
-    { id: '4', name: 'Contenaissance Branding', icon: '✨', description: 'Real-time viral content strategies.' },
-    { id: '5', name: 'Content Writer Team', icon: '📝', description: 'SEO-optimized articles and copywriting.' }
-  ]);
+
+  // Spaces list: from API when authenticated, default spaces on landing when not
+  const [departmentsList, setDepartmentsList] = useState<Space[]>([]);
+  const spacesList = auth.isAuthenticated ? departmentsList : DEFAULT_SPACES;
 
   // Persistent History State
   const [sessions, setSessions] = useState<ChatSession[]>(() => {
@@ -163,6 +264,68 @@ const App = () => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastUserMessageRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pendingTitleRef = useRef<string | null>(null);
+
+  // Close conversation dropdown when clicking outside
+  useEffect(() => {
+    if (!conversationMenuOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (conversationMenuRef.current && !conversationMenuRef.current.contains(e.target as Node)) {
+        setConversationMenuOpen(null);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [conversationMenuOpen]);
+
+  // Show auth modal after a short delay when not authenticated (so user sees Anything AI page first)
+  useEffect(() => {
+    if (!auth.isAuthenticated) {
+      setAuthSuccessLoading(false);
+      const t = setTimeout(() => setAuthModalOpen(true), 1200);
+      return () => clearTimeout(t);
+    } else {
+      setAuthModalOpen(false);
+    }
+  }, [auth.isAuthenticated]);
+
+  // Fetch departments for register dropdown when auth modal is open
+  useEffect(() => {
+    if (!authModalOpen) return;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/departments`);
+        if (!res.ok) return;
+        const data = await res.json();
+        setAuthDepartmentsForDropdown((data.departments as ApiDepartment[]) ?? []);
+      } catch {
+        // ignore
+      }
+    })();
+  }, [authModalOpen]);
+
+  // Fetch departments when authenticated
+  useEffect(() => {
+    if (!auth.isAuthenticated || !auth.token) return;
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/departments`, { signal: controller.signal });
+        if (!res.ok) return;
+        const data = await res.json();
+        const list = (data.departments as ApiDepartment[]).map((d) => ({
+          id: d.id,
+          name: d.name,
+          icon: d.icon ?? '💬',
+          description: d.description ?? '',
+        }));
+        setDepartmentsList(list);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => controller.abort();
+  }, [auth.isAuthenticated, auth.token]);
 
   // Sync to localStorage
   useEffect(() => {
@@ -221,6 +384,81 @@ const App = () => {
       .sort((a, b) => b.lastUpdated - a.lastUpdated);
   }, [sessions, activeSpace]);
 
+  // Fetch conversations when entering a department (authenticated)
+  useEffect(() => {
+    if (!activeSpace || !auth.token) {
+      setConversationsList([]);
+      setDepartmentAccessError(null);
+      return;
+    }
+    setDepartmentAccessError(null);
+    const controller = new AbortController();
+    const params = new URLSearchParams({ departmentId: activeSpace.id });
+    const code = accessCodeMap[activeSpace.id];
+    if (code) params.set('accessCode', code);
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/conversations?${params}`, {
+          headers: { Authorization: `Bearer ${auth.token}` },
+          signal: controller.signal,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (res.status === 403 && activeSpace) {
+            setDepartmentAccessError((data.message as string) || 'Invalid access code.');
+            setConversationsList([]);
+            setAccessCodeMap((prev) => {
+              const next = { ...prev };
+              delete next[activeSpace.id];
+              return next;
+            });
+            setAccessCodeModalDept(activeSpace);
+            setAccessCodeInput(['', '', '', '']);
+          } else {
+            setDepartmentAccessError(null);
+            setConversationsList([]);
+          }
+          return;
+        }
+        setDepartmentAccessError(null);
+        setConversationsList((data.conversations as ApiConversation[]) ?? []);
+      } catch {
+        setConversationsList([]);
+      }
+    })();
+    return () => controller.abort();
+  }, [activeSpace?.id, auth.token, accessCodeMap, conversationsRefreshTrigger]);
+
+  // History loading state
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  // Fetch all conversations when opening History view
+  useEffect(() => {
+    if (currentView !== 'history' || !auth.token) {
+      if (currentView !== 'history') setHistoryLoading(false);
+      return;
+    }
+    setHistoryLoading(true);
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/conversations/all`, {
+          headers: { Authorization: `Bearer ${auth.token}` },
+        });
+        if (!res.ok) {
+          setAllConversationsList([]);
+          return;
+        }
+        const data = await res.json();
+        const list = (data.conversations as ApiConversation[]) ?? [];
+        setAllConversationsList(list);
+      } catch {
+        setAllConversationsList([]);
+      } finally {
+        setHistoryLoading(false);
+      }
+    })();
+  }, [currentView, auth.token, conversationsRefreshTrigger]);
+
   const lastModelIndex = useMemo(
     () => [...chatHistory].map((m) => m.role).lastIndexOf('model'),
     [chatHistory]
@@ -231,42 +469,151 @@ const App = () => {
   const handleOpenHistory = () => setCurrentView('history');
   const handleStartNewChatFlow = () => setCurrentView('select-space');
   
-  const handleSpaceSelection = (space: Space) => {
+  const openDepartment = (space: Space) => {
     setActiveSpace(space);
-    const latestForSpace = sessions
-      .filter(s => s.spaceId === space.id)
-      .sort((a, b) => b.lastUpdated - a.lastUpdated)[0];
-
-    if (latestForSpace) {
-      resumeSession(latestForSpace);
-    } else {
-      createNewSessionInSpace(space);
-    }
-  };
-
-  const createNewSessionInSpace = (space: Space) => {
-    const newSessionId = generateId();
-    setActiveSpace(space);
-    setActiveSessionId(newSessionId);
+    setActiveConversationId(null);
     setChatHistory([]);
     setSelectedImage(null);
     setInputValue('');
-    
+    setCurrentView('chat');
+  };
+
+  const handleSpaceSelection = (space: Space) => {
+    if (!auth.isAuthenticated) {
+      setAuthSuccessLoading(false);
+      setAuthModalOpen(true);
+      return;
+    }
+    const userDeptId = auth.user?.departmentId;
+    if (userDeptId != null && space.id != null && String(space.id) === String(userDeptId)) {
+      openDepartment(space);
+      return;
+    }
+    setDepartmentAccessError(null);
+    setAccessCodeModalDept(space);
+  };
+
+  const loadConversation = async (convId: string) => {
+    if (!auth.token) return;
+    setConversationMenuOpen(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/conversations/${convId}/messages`, {
+        headers: { Authorization: `Bearer ${auth.token}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      const messages = (data.messages as ApiMessage[]) ?? [];
+      setChatHistory(
+        messages.map((m) => ({
+          role: m.role,
+          text: m.text,
+          sources: undefined,
+          weather: null,
+          time: null,
+          webResults: undefined,
+          lastUpdated: undefined,
+          sourceCount: undefined,
+        }))
+      );
+      setActiveConversationId(convId);
+      setSelectedImage(null);
+      setInputValue('');
+      setCurrentView('chat');
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleRenameConversation = (conv: ApiConversation, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setConversationMenuOpen(null);
+    setRenameModalConv(conv);
+    setRenameInput(conv.title || 'New Conversation');
+  };
+
+  const handleRenameSubmit = async () => {
+    if (!renameModalConv || !auth.token) return;
+    const title = renameInput.trim().slice(0, 80) || 'New Conversation';
+    try {
+      const res = await fetch(`${API_BASE}/api/conversations/${renameModalConv.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${auth.token}` },
+        body: JSON.stringify({ title }),
+      });
+      if (!res.ok) return;
+      setConversationsList((prev) => prev.map((c) => (c.id === renameModalConv.id ? { ...c, title } : c)));
+      setRenameModalConv(null);
+      setRenameInput('');
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleDeleteConversation = async (conv: ApiConversation, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setConversationMenuOpen(null);
+    if (!window.confirm('Delete this conversation? This cannot be undone.')) return;
+    if (!auth.token) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/conversations/${conv.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${auth.token}` } });
+      if (!res.ok) return;
+      setConversationsList((prev) => prev.filter((c) => c.id !== conv.id));
+      if (activeConversationId === conv.id) {
+        setActiveConversationId(null);
+        setChatHistory([]);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handlePinConversation = async (conv: ApiConversation, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setConversationMenuOpen(null);
+    if (!auth.token) return;
+    const nextPinned = !conv.pinned;
+    try {
+      const res = await fetch(`${API_BASE}/api/conversations/${conv.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${auth.token}` },
+        body: JSON.stringify({ pinned: nextPinned }),
+      });
+      if (!res.ok) return;
+      setConversationsList((prev) => prev.map((c) => (c.id === conv.id ? { ...c, pinned: nextPinned } : c)).sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()));
+    } catch {
+      // ignore
+    }
+  };
+
+  const openConversationFromHistory = (conv: ApiConversation) => {
+    const deptId = conv.departmentId;
+    const space = spacesList.find((s) => s.id === deptId) ?? null;
+    if (space) setActiveSpace(space);
+    loadConversation(conv.id);
+  };
+
+  const createNewSessionInSpace = (space: Space) => {
+    setActiveSpace(space);
+    setActiveConversationId(null);
+    setActiveSessionId(generateId());
+    setChatHistory([]);
+    setSelectedImage(null);
+    setInputValue('');
+    setCurrentView('chat');
     setSessions(prev => [{
-      id: newSessionId,
+      id: generateId(),
       spaceId: space.id,
       title: 'New Conversation',
       messages: [],
       lastUpdated: Date.now()
     }, ...prev]);
-
-    setCurrentView('chat');
   };
 
   const resumeSession = (session: ChatSession) => {
     const space = spacesList.find(s => s.id === session.spaceId) || null;
     setActiveSpace(space);
     setActiveSessionId(session.id);
+    setActiveConversationId(null);
     setChatHistory(session.messages);
     setSelectedImage(null);
     setInputValue('');
@@ -544,9 +891,16 @@ const App = () => {
     options?: { replaceLastModel?: boolean; historyOverride?: { role: 'user' | 'model'; text: string }[] }
   ) => {
     const message = userMessage.trim();
-    if (!message) return;
-    if (!userMessage && !selectedImage) return;
-    
+    if (!message && !selectedImage) return;
+    if (!activeSpace?.id) return;
+    if (!auth.token) return;
+
+    const firstMessageTitle = (message || (selectedImage ? 'Image' : 'New Conversation')).slice(0, 80).trim() || 'New Conversation';
+    if (!activeConversationId) {
+      pendingTitleRef.current = firstMessageTitle;
+      setPendingConversationTitle(firstMessageTitle);
+    }
+
     const currentImage = selectedImage;
     setInputValue('');
     setSelectedImage(null);
@@ -671,11 +1025,18 @@ ${geminiStyle}`;
       history?: { role: 'user' | 'model'; text: string }[];
       imageBase64?: string;
       mimeType?: string;
+      departmentId?: string;
+      conversationId?: string | null;
+      accessCode?: string;
     } = { message, systemInstruction, history };
     if (currentImage) {
       payload.imageBase64 = currentImage.split(',')[1];
       payload.mimeType = currentImage.split(';')[0].split(':')[1];
     }
+    if (activeSpace?.id) payload.departmentId = activeSpace.id;
+    if (activeConversationId) payload.conversationId = activeConversationId;
+    const code = activeSpace?.id ? accessCodeMap[activeSpace.id] : undefined;
+    if (code) payload.accessCode = code;
 
     setSearchSteps([]);
     if (options?.replaceLastModel) {
@@ -691,13 +1052,34 @@ ${geminiStyle}`;
     }
 
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (auth.token) headers['Authorization'] = `Bearer ${auth.token}`;
       const res = await fetch(`${API_BASE}/api/chat/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(payload),
       });
       if (!res.ok || !res.body) {
         let errMessage = 'Request failed.';
+        if (res.status === 403 && activeSpace) {
+          try {
+            const body = await res.json().catch(() => null);
+            errMessage = (body?.message as string) || 'Invalid access code.';
+            setDepartmentAccessError(errMessage);
+          } catch {
+            setDepartmentAccessError('Invalid access code.');
+          }
+          setIsThinking(false);
+          setChatHistory((prev) => (prev.length > 0 && prev[prev.length - 1]?.role === 'model' ? prev.slice(0, -1) : prev));
+          setAccessCodeMap((prev) => {
+            const next = { ...prev };
+            delete next[activeSpace.id];
+            return next;
+          });
+          setAccessCodeModalDept(activeSpace);
+          setAccessCodeInput(['', '', '', '']);
+          return;
+        }
         if (res.status === 429) errMessage = 'Too many requests. Please wait a moment.';
         else if (res.status === 502 || res.status === 503) errMessage = 'API server is not running. Start it with: npm run server';
         else {
@@ -738,6 +1120,21 @@ ${geminiStyle}`;
               break;
             }
             if ('type' in data) {
+              if (data.type === 'conversation') {
+                const conv = data as StreamConversation;
+                if (conv.conversationId) {
+                  setActiveConversationId(conv.conversationId);
+                  const title = conv.title ?? pendingTitleRef.current ?? 'New Conversation';
+                  setConversationsList((prev) => {
+                    const already = prev.some((c) => c.id === conv.conversationId);
+                    if (already) return prev;
+                    return [
+                      { id: conv.conversationId, title, updatedAt: new Date().toISOString(), departmentId: activeSpace?.id },
+                      ...prev,
+                    ];
+                  });
+                }
+              }
               if (data.type === 'meta') {
                 const meta = data as StreamMeta;
                 
@@ -823,6 +1220,13 @@ ${geminiStyle}`;
                   return prev;
                 });
               }
+              if (data.type === 'done') {
+                setConversationsRefreshTrigger((t) => t + 1);
+                setTimeout(() => {
+                  setPendingConversationTitle(null);
+                  pendingTitleRef.current = null;
+                }, 2000);
+              }
             }
           } catch {
             // skip malformed events
@@ -899,9 +1303,300 @@ ${geminiStyle}`;
     </button>
   );
 
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    setAuthLoading(true);
+    try {
+      const url = authIsRegister ? `${API_BASE}/api/auth/register` : `${API_BASE}/api/auth/login`;
+      const body = authIsRegister
+        ? { email: authEmail.trim(), password: authPassword, departmentName: authDepartmentName.trim() }
+        : { email: authEmail.trim(), password: authPassword };
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setAuthError((data.message as string) || 'Request failed');
+        setAuthLoading(false);
+        return;
+      }
+      const token = data.token as string;
+      const rawUser = data.user as { id?: unknown; email?: string; departmentId?: unknown; departmentName?: string | null };
+      if (token && rawUser?.email) {
+        const user: AuthUser = {
+          id: String(rawUser.id ?? ''),
+          email: rawUser.email,
+          departmentId: String(rawUser.departmentId ?? ''),
+          departmentName: rawUser.departmentName ?? null,
+        };
+        setAuthLoading(false);
+        setAuthSuccessLoading(true);
+        await new Promise((r) => setTimeout(r, 2000));
+        localStorage.setItem(AUTH_TOKEN_KEY, token);
+        localStorage.setItem(AUTH_USER_KEY, JSON.stringify(user));
+        setAuth({ token, user, isAuthenticated: true });
+        setAuthModalOpen(false);
+        setAuthSuccessLoading(false);
+        setAuthEmail('');
+        setAuthPassword('');
+        setAuthDepartmentName('');
+      }
+    } catch {
+      setAuthError('Network error');
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleAccessCodeSubmit = async () => {
+    const code = accessCodeInput.join('');
+    if (code.length !== 4 || !accessCodeModalDept || !auth.token) return;
+    setDepartmentAccessError(null);
+    setAccessCodeChecking(true);
+    try {
+      const params = new URLSearchParams({ departmentId: accessCodeModalDept.id, accessCode: code });
+      const res = await fetch(`${API_BASE}/api/conversations?${params}`, {
+        headers: { Authorization: `Bearer ${auth.token}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 403) {
+        setDepartmentAccessError((data.message as string) || 'Invalid access code.');
+        return;
+      }
+      if (!res.ok) {
+        setDepartmentAccessError('Something went wrong. Try again.');
+        return;
+      }
+      setAccessCodeMap((prev) => ({ ...prev, [accessCodeModalDept.id]: code }));
+      setAccessCodeModalDept(null);
+      setAccessCodeInput(['', '', '', '']);
+      openDepartment(accessCodeModalDept);
+    } finally {
+      setAccessCodeChecking(false);
+    }
+  };
+
   return (
     <div className="h-screen bg-[#0e0e0e] text-[#e3e3e3] font-['Inter'] flex overflow-hidden">
 
+      {/* Auth Modal: show after delay when not authenticated; blurred background */}
+      {authModalOpen && !auth.isAuthenticated && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 backdrop-blur-xl p-4">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+            className="relative w-full max-w-md"
+          >
+            {/* Gradient border glow */}
+            <div className="absolute -inset-[1px] rounded-[1.25rem] bg-gradient-to-br from-[#4b90ff]/60 via-[#00d9ff]/40 to-[#ff5546]/40 opacity-80 blur-sm" />
+            <div className="relative w-full rounded-2xl bg-[#0e0e0e] border border-white/10 shadow-2xl shadow-[#4b90ff]/10 p-8 overflow-hidden">
+              {/* Subtle grid / theme accent */}
+              <div className="absolute inset-0 opacity-[0.03]" style={{ backgroundImage: 'radial-gradient(#ffffff 0.5px, transparent 0.5px)', backgroundSize: '20px 20px' }} />
+              <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[#4b90ff]/50 to-transparent" />
+              <button
+                type="button"
+                onClick={() => setAuthModalOpen(false)}
+                className="absolute top-4 right-4 p-2 text-[#8e918f] hover:text-white rounded-xl hover:bg-white/5 transition-colors z-10"
+                aria-label="Close"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+              </button>
+
+              {authSuccessLoading ? (
+                <div className="flex flex-col items-center justify-center py-12 space-y-6">
+                  <motion.div
+                    initial={{ scale: 0.8, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={{ duration: 0.3 }}
+                    className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#4b90ff] to-[#00d9ff] flex items-center justify-center shadow-[0_0_40px_rgba(75,144,255,0.4)]"
+                  >
+                    <Loader2 className="w-8 h-8 text-white animate-spin" />
+                  </motion.div>
+                  <p className="text-lg font-semibold text-white">
+                    {authIsRegister ? 'Creating your account...' : 'Signing you in...'}
+                  </p>
+                  <p className="text-sm text-[#8e918f]">Just a moment</p>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center gap-3 mb-6">
+                    <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#4b90ff] to-[#ff5546] flex items-center justify-center text-sm font-bold text-white shadow-lg">
+                      AI
+                    </div>
+                    <h2 className="text-2xl font-bold text-white tracking-tight">
+                      {authIsRegister ? 'Create account' : 'Welcome back'}
+                    </h2>
+                  </div>
+                  <form onSubmit={handleAuthSubmit} className="space-y-4 relative">
+                    {authError && (
+                      <motion.div
+                        initial={{ opacity: 0, y: -4 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-xl px-4 py-2.5"
+                      >
+                        {authError}
+                      </motion.div>
+                    )}
+                    <div>
+                      <label className="block text-xs font-bold uppercase tracking-widest text-[#8e918f] mb-2">Email</label>
+                      <input
+                        type="email"
+                        value={authEmail}
+                        onChange={(e) => setAuthEmail(e.target.value)}
+                        required
+                        className="w-full px-4 py-3 rounded-xl bg-[#1e1f20] border border-white/10 text-white placeholder-[#444746] focus:border-[#4b90ff] focus:ring-1 focus:ring-[#4b90ff]/30 outline-none transition-all"
+                        placeholder="you@example.com"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold uppercase tracking-widest text-[#8e918f] mb-2">Password</label>
+                      <input
+                        type="password"
+                        value={authPassword}
+                        onChange={(e) => setAuthPassword(e.target.value)}
+                        required
+                        className="w-full px-4 py-3 rounded-xl bg-[#1e1f20] border border-white/10 text-white placeholder-[#444746] focus:border-[#4b90ff] focus:ring-1 focus:ring-[#4b90ff]/30 outline-none transition-all"
+                        placeholder="••••••••"
+                      />
+                    </div>
+                    {authIsRegister && (
+                      <div>
+                        <label className="block text-xs font-bold uppercase tracking-widest text-[#8e918f] mb-2">Department</label>
+                        <select
+                          value={authDepartmentName}
+                          onChange={(e) => setAuthDepartmentName(e.target.value)}
+                          required={authIsRegister}
+                          className="w-full px-4 py-3 rounded-xl bg-[#1e1f20] border border-white/10 text-white focus:border-[#4b90ff] focus:ring-1 focus:ring-[#4b90ff]/30 outline-none transition-all"
+                        >
+                          <option value="">Select department</option>
+                          {authDepartmentsForDropdown.map((d) => (
+                            <option key={d.id} value={d.name}>{d.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    <button
+                      type="submit"
+                      disabled={authLoading}
+                      className="w-full py-3.5 rounded-xl bg-gradient-to-r from-[#4b90ff] to-[#3a7ad9] text-white font-semibold hover:opacity-95 disabled:opacity-50 transition-all shadow-[0_0_20px_rgba(75,144,255,0.2)]"
+                    >
+                      {authLoading ? (
+                        <span className="flex items-center justify-center gap-2">
+                          <Loader2 className="w-5 h-5 animate-spin" />
+                          Please wait...
+                        </span>
+                      ) : authIsRegister ? 'Register' : 'Sign in'}
+                    </button>
+                  </form>
+                  <p className="mt-5 text-center text-sm text-[#8e918f]">
+                    {authIsRegister ? 'Already have an account?' : "Don't have an account?"}{' '}
+                    <button
+                      type="button"
+                      onClick={() => { setAuthIsRegister(!authIsRegister); setAuthError(''); }}
+                      className="text-[#4b90ff] hover:underline font-medium"
+                    >
+                      {authIsRegister ? 'Sign in' : 'Register'}
+                    </button>
+                  </p>
+                </>
+              )}
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* Access Code Modal (4-digit OTP style) */}
+      {accessCodeModalDept && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/90 p-4">
+          <div className="w-full max-w-sm rounded-2xl bg-[#1e1f20] border border-white/10 shadow-2xl p-8">
+            <h2 className="text-xl font-bold text-white mb-2 text-center">Access code</h2>
+            <p className="text-sm text-[#8e918f] mb-2 text-center">{accessCodeModalDept.name}</p>
+            {departmentAccessError && (
+              <p className="text-red-400 text-sm text-center mb-4">{departmentAccessError}</p>
+            )}
+            <div className="flex justify-center gap-2 mb-6">
+              {[0, 1, 2, 3].map((i) => (
+                <input
+                  key={i}
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={1}
+                  value={accessCodeInput[i]}
+                  onChange={(e) => {
+                    setDepartmentAccessError(null);
+                    const v = e.target.value.replace(/\D/g, '').slice(0, 1);
+                    setAccessCodeInput((prev) => {
+                      const next = [...prev];
+                      next[i] = v;
+                      if (v && i < 3) (document.querySelector(`input[data-otp="${i + 1}"]`) as HTMLInputElement)?.focus();
+                      return next;
+                    });
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Backspace' && !accessCodeInput[i] && i > 0)
+                      (document.querySelector(`input[data-otp="${i - 1}"]`) as HTMLInputElement)?.focus();
+                  }}
+                  data-otp={i}
+                  className="w-14 h-14 rounded-xl bg-[#0e0e0e] border border-white/10 text-white text-center text-xl font-bold focus:border-[#4b90ff] outline-none"
+                />
+              ))}
+            </div>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={() => { setAccessCodeModalDept(null); setAccessCodeInput(['', '', '', '']); setDepartmentAccessError(null); }}
+                className="flex-1 py-3 rounded-xl border border-white/10 text-[#8e918f] hover:bg-white/5 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleAccessCodeSubmit}
+                disabled={accessCodeInput.join('').length !== 4 || accessCodeChecking}
+                className="flex-1 py-3 rounded-xl bg-[#4b90ff] text-white font-semibold hover:bg-[#3a7ad9] disabled:opacity-50 transition-colors flex items-center justify-center gap-2"
+              >
+                {accessCodeChecking ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Checking...
+                  </>
+                ) : (
+                  'Submit'
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Rename conversation modal */}
+      {renameModalConv && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4" onClick={() => { setRenameModalConv(null); setRenameInput(''); }}>
+          <div className="relative w-full max-w-md rounded-2xl bg-[#1e1f20] border border-white/10 shadow-2xl p-6" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-lg font-semibold text-white mb-3">Rename conversation</h3>
+            <input
+              type="text"
+              value={renameInput}
+              onChange={(e) => setRenameInput(e.target.value.slice(0, 80))}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleRenameSubmit(); if (e.key === 'Escape') { setRenameModalConv(null); setRenameInput(''); } }}
+              placeholder="Conversation title"
+              className="w-full px-4 py-3 rounded-xl bg-[#0e0e0e] border border-white/10 text-white placeholder-[#8e918f] focus:border-[#4b90ff] outline-none mb-4"
+              autoFocus
+            />
+            <div className="flex gap-3">
+              <button type="button" onClick={() => { setRenameModalConv(null); setRenameInput(''); }} className="flex-1 py-3 rounded-xl border border-white/10 text-[#8e918f] hover:bg-white/5 transition-colors">Cancel</button>
+              <button type="button" onClick={handleRenameSubmit} className="flex-1 py-3 rounded-xl bg-[#4b90ff] text-white font-semibold hover:bg-[#3a7ad9] transition-colors">Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Main app: always visible (Anything AI page first, then login popup on top) */}
+      <>
       {/* Primary Sidebar (desktop only) */}
       <aside className="hidden md:flex fixed left-0 top-0 h-screen w-20 bg-[#0e0e0e] border-r border-white/5 flex-col items-center py-6 z-[100]">
         <div className="mb-8 text-[#4b90ff] cursor-pointer hover:scale-110 transition-transform" onClick={() => setCurrentView('home')}>
@@ -913,8 +1608,21 @@ ${geminiStyle}`;
         <SidebarItem icon={<Layers size={18} />} label="Spaces" onClick={handleOpenSpaces} isActive={currentView === 'spaces'} />
 
         <div className="mt-auto flex flex-col items-center">
-          <SidebarItem icon={<User size={18} />} label="Profile" onClick={() => setCurrentView('home')} />
-          <SidebarItem icon={<Settings size={18} />} label="Settings" onClick={() => setCurrentView('home')} />
+          <SidebarItem icon={<User size={18} />} label="Profile" onClick={() => setCurrentView('profile')} isActive={currentView === 'profile'} />
+          <button
+            onClick={() => {
+              localStorage.removeItem(AUTH_TOKEN_KEY);
+              localStorage.removeItem(AUTH_USER_KEY);
+              setAuth({ token: null, user: null, isAuthenticated: false });
+              setAuthSuccessLoading(false);
+              setAuthModalOpen(true);
+            }}
+            className="group relative flex flex-col items-center justify-center w-14 h-14 rounded-2xl transition-all duration-300 mb-4 text-[#8e918f] hover:bg-white/5 hover:text-white"
+            aria-label="Log out"
+          >
+            <LogOut size={18} className="transition-transform duration-300 group-hover:scale-110" />
+            <span className="absolute left-full ml-4 px-2 py-1 bg-[#282a2c] text-white text-[10px] font-bold uppercase tracking-widest rounded opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity whitespace-nowrap z-[100]">Log out</span>
+          </button>
         </div>
       </aside>
 
@@ -939,24 +1647,84 @@ ${geminiStyle}`;
             
             <div className="flex-1 overflow-y-auto no-scrollbar p-3 space-y-1">
               <div className="px-3 py-2 text-[10px] font-bold text-[#444746] uppercase tracking-[0.2em]">Recent in Space</div>
-              {activeSpaceSessions.map(session => (
-                <button
-                  key={session.id}
-                  onClick={() => resumeSession(session)}
-                  className={`w-full group px-4 py-3 rounded-xl text-left transition-all relative flex items-center justify-between
-                    ${activeSessionId === session.id ? 'bg-[#1e1f20] text-white' : 'text-[#8e918f] hover:bg-white/5 hover:text-[#e3e3e3]'}`}
-                >
-                  <div className="flex flex-col truncate pr-4">
-                    <span className="text-sm font-medium truncate">{session.title}</span>
-                    <span className="text-[10px] opacity-40 mt-0.5">
-                      {new Date(session.lastUpdated).toLocaleDateString([], { month: 'short', day: 'numeric' })}
-                    </span>
-                  </div>
-                  <div onClick={(e) => deleteSession(e, session.id)} className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 transition-opacity">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-                  </div>
-                </button>
-              ))}
+              {auth.isAuthenticated && conversationsList.length >= 0 ? (
+                <>
+                  {conversationsList.map((conv) => {
+                    const isActive = activeConversationId === conv.id;
+                    const showAnimatedTitle = isActive && pendingConversationTitle !== null;
+                    const displayTitle = showAnimatedTitle ? pendingConversationTitle : (conv.title || 'New Conversation');
+                    const menuOpen = conversationMenuOpen === conv.id;
+                    return (
+                      <div
+                        key={conv.id}
+                        ref={(el) => { if (menuOpen && el) conversationMenuRef.current = el; else if (conversationMenuRef.current === el) conversationMenuRef.current = null; }}
+                        className={`w-full group rounded-xl transition-all relative flex items-center
+                          ${isActive ? 'bg-[#1e1f20]' : 'hover:bg-white/5'}`}
+                      >
+                        <button
+                          onClick={() => loadConversation(conv.id)}
+                          className={`flex-1 min-w-0 px-4 py-3 text-left flex items-center justify-between
+                            ${isActive ? 'text-white' : 'text-[#8e918f] hover:text-[#e3e3e3]'}`}
+                        >
+                          <div className="flex flex-col truncate pr-2 min-w-0">
+                            <span className="text-sm font-medium truncate block flex items-center gap-1.5">
+                              {conv.pinned && <span className="text-[10px] text-[#4b90ff] shrink-0" title="Pinned">📌</span>}
+                              {showAnimatedTitle ? (
+                                <AnimatedTitle text={displayTitle} className="text-sm font-medium" />
+                              ) : (
+                                displayTitle
+                              )}
+                            </span>
+                            <span className="text-[10px] opacity-40 mt-0.5">
+                              {conv.updatedAt ? new Date(conv.updatedAt).toLocaleDateString([], { month: 'short', day: 'numeric' }) : ''}
+                            </span>
+                          </div>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setConversationMenuOpen((prev) => (prev === conv.id ? null : conv.id)); }}
+                          className={`p-2 rounded-lg shrink-0 transition-opacity ${menuOpen ? 'opacity-100 text-[#e3e3e3]' : 'opacity-0 group-hover:opacity-100'} text-[#8e918f] hover:text-[#e3e3e3] hover:bg-white/5`}
+                          aria-label="Conversation options"
+                        >
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
+                        </button>
+                        {menuOpen && (
+                          <div className="absolute right-2 top-full mt-1 z-50 min-w-[140px] py-1 rounded-lg bg-[#1e1f20] border border-white/10 shadow-xl" onClick={(e) => e.stopPropagation()}>
+                            <button type="button" onClick={(e) => handleRenameConversation(conv, e)} className="w-full px-4 py-2.5 text-left text-sm text-[#e3e3e3] hover:bg-white/5 flex items-center gap-2">
+                              <span>Rename</span>
+                            </button>
+                            <button type="button" onClick={(e) => handlePinConversation(conv, e)} className="w-full px-4 py-2.5 text-left text-sm text-[#e3e3e3] hover:bg-white/5 flex items-center gap-2">
+                              <span>{conv.pinned ? 'Unpin' : 'Pin'}</span>
+                            </button>
+                            <button type="button" onClick={(e) => handleDeleteConversation(conv, e)} className="w-full px-4 py-2.5 text-left text-sm text-[#ff5546] hover:bg-white/5 flex items-center gap-2">
+                              <span>Delete</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </>
+              ) : (
+                activeSpaceSessions.map(session => (
+                  <button
+                    key={session.id}
+                    onClick={() => resumeSession(session)}
+                    className={`w-full group px-4 py-3 rounded-xl text-left transition-all relative flex items-center justify-between
+                      ${activeSessionId === session.id ? 'bg-[#1e1f20] text-white' : 'text-[#8e918f] hover:bg-white/5 hover:text-[#e3e3e3]'}`}
+                  >
+                    <div className="flex flex-col truncate pr-4">
+                      <span className="text-sm font-medium truncate">{session.title}</span>
+                      <span className="text-[10px] opacity-40 mt-0.5">
+                        {new Date(session.lastUpdated).toLocaleDateString([], { month: 'short', day: 'numeric' })}
+                      </span>
+                    </div>
+                    <div onClick={(e) => deleteSession(e, session.id)} className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 transition-opacity">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                    </div>
+                  </button>
+                ))
+              )}
             </div>
           </aside>
         )}
@@ -979,7 +1747,7 @@ ${geminiStyle}`;
             )}
             <div className="flex items-center space-x-2">
                <span className="text-sm font-bold uppercase tracking-[0.2em] text-[#8e918f]">
-                {activeSpace ? activeSpace.name : 'Anything AI Workspace'}
+                {currentView === 'profile' ? 'Profile' : activeSpace ? activeSpace.name : 'ASK ANYTHING'}
               </span>
             </div>
           </div>
@@ -995,6 +1763,9 @@ ${geminiStyle}`;
                   Hey, I'm Anything AI.
                 </h1>
                 <p className="text-3xl font-medium text-[#444746] mb-12">Choose a specialized space to begin.</p>
+                {spacesList.length === 0 ? (
+                  <p className="text-[#8e918f]">Loading departments...</p>
+                ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   {spacesList.map(space => (
                     <button key={space.id} onClick={() => handleSpaceSelection(space)} className="p-8 bg-[#1e1f20] hover:bg-[#282a2c] border border-white/5 rounded-[2rem] text-left transition-all group relative overflow-hidden">
@@ -1005,6 +1776,7 @@ ${geminiStyle}`;
                     </button>
                   ))}
                 </div>
+                )}
               </div>
             )}
 
@@ -1299,78 +2071,52 @@ ${geminiStyle}`;
             {currentView === 'history' && (
               <div className="animate-in fade-in slide-in-from-bottom-6 duration-700 mt-8">
                 <h2 className="text-4xl font-bold mb-10 text-white tracking-tight">Chat History</h2>
-                
-                {sessions.length === 0 ? (
+
+                {!auth.isAuthenticated ? (
+                  <div className="text-center py-20">
+                    <p className="text-[#8e918f]">Sign in to see your conversations.</p>
+                  </div>
+                ) : historyLoading ? (
+                  <div className="flex flex-col items-center justify-center py-20">
+                    <Loader2 className="w-12 h-12 text-[#4b90ff] animate-spin mb-4" />
+                    <p className="text-[#8e918f]">Loading your conversations...</p>
+                  </div>
+                ) : allConversationsList.length === 0 ? (
                   <div className="text-center py-20">
                     <History size={48} className="mx-auto mb-4 text-[#8e918f]" />
-                    <p className="text-[#8e918f] text-lg">No chat history yet</p>
-                    <p className="text-[#444746] text-sm mt-2">Start a conversation to see your history here</p>
+                    <p className="text-[#8e918f] text-lg">No conversations yet</p>
+                    <p className="text-[#444746] text-sm mt-2">Start a chat in any space to see it here</p>
                   </div>
                 ) : (
                   <div className="space-y-8">
                     {spacesList.map(space => {
-                      const spaceSessions = sessions
-                        .filter(s => s.spaceId === space.id)
-                        .sort((a, b) => b.lastUpdated - a.lastUpdated);
-                      
-                      if (spaceSessions.length === 0) return null;
-                      
+                      const deptConvs = allConversationsList
+                        .filter(c => String(c.departmentId) === String(space.id))
+                        .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+                      if (deptConvs.length === 0) return null;
                       return (
                         <div key={space.id} className="space-y-4">
                           <div className="flex items-center gap-3 mb-4">
                             <span className="text-2xl">{space.icon}</span>
                             <h3 className="text-2xl font-bold text-white">{space.name}</h3>
-                            <span className="text-sm text-[#8e918f]">({spaceSessions.length} {spaceSessions.length === 1 ? 'chat' : 'chats'})</span>
+                            <span className="text-sm text-[#8e918f]">({deptConvs.length} {deptConvs.length === 1 ? 'chat' : 'chats'})</span>
                           </div>
-                          
                           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                            {spaceSessions.map(session => (
+                            {deptConvs.map(conv => (
                               <button
-                                key={session.id}
-                                onClick={() => resumeSession(session)}
+                                key={conv.id}
+                                onClick={() => openConversationFromHistory(conv)}
                                 className="group p-6 bg-[#1e1f20] border border-white/5 rounded-2xl text-left transition-all hover:border-[#4b90ff]/50 hover:bg-[#282a2c]"
                               >
-                                <div className="flex items-start justify-between mb-3">
-                                  <div className="flex-1 min-w-0">
-                                    <h4 className="text-sm font-semibold text-white group-hover:text-[#4b90ff] transition-colors truncate mb-1">
-                                      {session.title || 'New Chat'}
-                                    </h4>
-                                    <p className="text-[10px] text-[#8e918f]">
-                                      {new Date(session.lastUpdated).toLocaleDateString([], { 
-                                        month: 'short', 
-                                        day: 'numeric',
-                                        year: session.lastUpdated > Date.now() - 31536000000 ? undefined : 'numeric'
-                                      })}
-                                      {' • '}
-                                      {new Date(session.lastUpdated).toLocaleTimeString([], { 
-                                        hour: '2-digit', 
-                                        minute: '2-digit' 
-                                      })}
-                                    </p>
-                                  </div>
-                                  <div 
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      deleteSession(e as any, session.id);
-                                    }}
-                                    className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 transition-all"
-                                  >
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                      <path d="M18 6L6 18M6 6l12 12"/>
-                                    </svg>
-                                  </div>
-                                </div>
-                                
-                                {session.messages.length > 0 && (
-                                  <div className="text-xs text-[#8e918f] line-clamp-2 mt-2">
-                                    {session.messages[session.messages.length - 1]?.role === 'user' 
-                                      ? session.messages[session.messages.length - 1]?.text
-                                      : session.messages.find(m => m.role === 'user')?.text || 'Chat started'}
-                                  </div>
-                                )}
-                                
-                                <div className="mt-3 flex items-center gap-2 text-[10px] text-[#4b90ff]">
-                                  <span>{session.messages.length} {session.messages.length === 1 ? 'message' : 'messages'}</span>
+                                <div className="flex flex-col min-w-0">
+                                  <h4 className="text-sm font-semibold text-white group-hover:text-[#4b90ff] transition-colors truncate mb-1">
+                                    {conv.title || 'New Conversation'}
+                                  </h4>
+                                  <p className="text-[10px] text-[#8e918f]">
+                                    {conv.updatedAt ? new Date(conv.updatedAt).toLocaleDateString([], { month: 'short', day: 'numeric', year: new Date(conv.updatedAt).getTime() < Date.now() - 31536000000 ? 'numeric' : undefined }) : ''}
+                                    {conv.updatedAt && ' • '}
+                                    {conv.updatedAt ? new Date(conv.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                                  </p>
                                 </div>
                               </button>
                             ))}
@@ -1378,6 +2124,94 @@ ${geminiStyle}`;
                         </div>
                       );
                     })}
+                    {/* Show conversations whose department is not in spacesList (e.g. deleted department) */}
+                    {(() => {
+                      const knownDeptIds = new Set(spacesList.map(s => String(s.id)));
+                      const otherConvs = allConversationsList
+                        .filter(c => !knownDeptIds.has(String(c.departmentId)))
+                        .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+                      if (otherConvs.length === 0) return null;
+                      return (
+                        <div className="space-y-4">
+                          <div className="flex items-center gap-3 mb-4">
+                            <span className="text-2xl">💬</span>
+                            <h3 className="text-2xl font-bold text-white">Other</h3>
+                            <span className="text-sm text-[#8e918f]">({otherConvs.length})</span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                            {otherConvs.map(conv => (
+                              <button
+                                key={conv.id}
+                                onClick={() => openConversationFromHistory(conv)}
+                                className="group p-6 bg-[#1e1f20] border border-white/5 rounded-2xl text-left transition-all hover:border-[#4b90ff]/50 hover:bg-[#282a2c]"
+                              >
+                                <div className="flex flex-col min-w-0">
+                                  <h4 className="text-sm font-semibold text-white group-hover:text-[#4b90ff] transition-colors truncate mb-1">
+                                    {conv.title || 'New Conversation'}
+                                  </h4>
+                                  <p className="text-[10px] text-[#8e918f]">
+                                    {conv.updatedAt ? new Date(conv.updatedAt).toLocaleDateString([], { month: 'short', day: 'numeric' }) : ''}
+                                    {conv.updatedAt && ' • '}
+                                    {conv.updatedAt ? new Date(conv.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                                  </p>
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {currentView === 'profile' && (
+              <div className="animate-in fade-in duration-500 py-12">
+                <h2 className="text-4xl font-bold mb-10 text-white tracking-tight">Profile</h2>
+                {auth.isAuthenticated && auth.user ? (
+                  <div className="p-8 bg-[#1e1f20] border border-white/5 rounded-[2rem] max-w-lg space-y-6">
+                    <div className="flex items-center gap-6">
+                      <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-[#4b90ff] to-[#ff5546] flex items-center justify-center text-3xl font-bold text-white shadow-lg">
+                        {auth.user.email.charAt(0).toUpperCase()}
+                      </div>
+                      <div>
+                        <h3 className="text-xl font-bold text-white">{auth.user.email}</h3>
+                        <p className="text-[10px] font-bold uppercase tracking-widest text-[#8e918f] mt-1">Signed in</p>
+                      </div>
+                    </div>
+                    <div className="border-t border-white/10 pt-6 space-y-4">
+                      <div>
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-[#8e918f]">Email</span>
+                        <p className="text-[#e3e3e3] mt-1">{auth.user.email}</p>
+                      </div>
+                      <div>
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-[#8e918f]">Department</span>
+                        <p className="text-[#e3e3e3] mt-1">{auth.user.departmentName ?? '—'}</p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => {
+                        localStorage.removeItem(AUTH_TOKEN_KEY);
+                        localStorage.removeItem(AUTH_USER_KEY);
+                        setAuth({ token: null, user: null, isAuthenticated: false });
+                        setAuthSuccessLoading(false);
+                        setAuthModalOpen(true);
+                      }}
+                      className="mt-4 px-6 py-3 rounded-xl border border-white/10 text-[#8e918f] hover:bg-white/5 hover:text-white transition-colors"
+                    >
+                      Sign out
+                    </button>
+                  </div>
+                ) : (
+                  <div className="p-8 bg-[#1e1f20] border border-white/5 rounded-[2rem] max-w-lg text-center">
+                    <p className="text-[#8e918f] mb-4">Sign in to view your profile.</p>
+                    <button
+                      onClick={() => { setAuthSuccessLoading(false); setAuthModalOpen(true); }}
+                      className="px-6 py-3 rounded-xl bg-[#4b90ff] text-white font-semibold hover:bg-[#3a7ad9] transition-colors"
+                    >
+                      Sign in
+                    </button>
                   </div>
                 )}
               </div>
@@ -1462,6 +2296,7 @@ ${geminiStyle}`;
         </button>
       </nav>
 
+      </>
       <style>{`
         .no-scrollbar::-webkit-scrollbar { display: none; }
         .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }

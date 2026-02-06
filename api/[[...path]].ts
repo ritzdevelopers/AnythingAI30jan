@@ -1,7 +1,15 @@
 /**
  * Vercel serverless handler: forwards all /api/* requests to the Express app.
- * Env vars (GEMINI_API_KEY, GOOGLE_SEARCH_API_KEY, etc.) must be set in Vercel Project Settings → Environment Variables.
+ * Vercel may pass the path without the /api prefix (e.g. /auth/register), so we normalize req.url so Express routes match.
  */
 import { app } from '../server/index';
 
-export default app;
+function handler(req: { url?: string }, res: unknown): void {
+  const url = req.url ?? '';
+  if (url && !url.startsWith('/api')) {
+    req.url = '/api' + (url.startsWith('/') ? url : '/' + url);
+  }
+  app(req as any, res as any);
+}
+
+export default handler;

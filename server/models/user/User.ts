@@ -7,5 +7,18 @@ export interface User {
 }
 
 const schema = new Schema<User>({
-     
+     email:{
+        type: String,
+        required: true,
+        unique: true,
+     },
+     password: { type: String, required: true },
+     departmentId:{
+        type: Schema.Types.ObjectId,
+        ref: 'Department',
+        required: true,
+     }
 })
+
+
+export default model<User>('User', schema);

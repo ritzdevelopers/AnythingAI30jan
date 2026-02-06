@@ -4,6 +4,7 @@ export interface Department {
     name: string;
     icon?: string;
     description?: string;
+    accessCode?: string;
     createdAt: Date;
 }
 
@@ -12,6 +13,9 @@ const departmentSchema = new Schema<Department>({
         type: String,
         required: true,
 
+    },
+    accessCode:{
+        type: String,
     },
     icon:{
         type: String,
