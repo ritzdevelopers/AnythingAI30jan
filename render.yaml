@@ -1,0 +1,12 @@
+# Render Blueprint: API (Express) as a Web Service
+# Frontend is deployed separately on Vercel.
+services:
+  - type: web
+    name: anything-ai-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    # Env vars: set in Render Dashboard (Environment) - do not commit secrets
+    # Required: GEMINI_API_KEY, MONGO_DB_URI
+    # Optional: GOOGLE_SEARCH_API_KEY, GEMINI_MODEL, VITE_GEMINI_API_KEY, PORT

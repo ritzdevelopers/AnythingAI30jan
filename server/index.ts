@@ -22,6 +22,7 @@ import { getWeatherData } from './utils/weatherService';
 import { getTimeData } from './utils/timeService';
 import { streamGenerateContent, type StreamChatPayload } from './aiService';
 import { performWebSearch } from './services/googleSearch';
+import connectDB from './db/db';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
@@ -149,6 +150,7 @@ app.use(apiErrorBoundary);
 if (process.env.VERCEL !== '1') {
   app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
+    connectDB();
   });
 }
 
