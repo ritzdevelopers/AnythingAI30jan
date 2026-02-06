@@ -27,7 +27,24 @@ import connectDB from './db/db';
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
-app.use(cors());
+// CORS: allow Vercel frontend and local dev (fixes "blocked by CORS policy" when frontend on Vercel calls Render backend)
+const allowedOrigins = [
+  'https://anything-ai-30january.vercel.app',
+  /^https:\/\/.*\.vercel\.app$/,  // preview deployments
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+];
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true); // same-origin or server-to-server
+      if (allowedOrigins.some((o) => (typeof o === 'string' ? o === origin : o.test(origin)))) return cb(null, true);
+      return cb(null, false);
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
 app.use(express.json({ limit: '1mb' }));
 
 // Rate limit all /api routes
