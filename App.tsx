@@ -71,6 +71,9 @@ interface ChatSession {
   lastUpdated: number;
 }
 
+// --- API base: empty locally (Vite proxy), set to Render URL in production (Vercel) ---
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');
+
 // --- Utilities ---
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
@@ -368,7 +371,7 @@ const App = () => {
 
   const fetchLiveWeather = async (query: string): Promise<WeatherData | null> => {
     try {
-      const res = await fetch(`/api/weather?query=${encodeURIComponent(query)}`);
+      const res = await fetch(`${API_BASE}/api/weather?query=${encodeURIComponent(query)}`);
       if (!res.ok) return null;
       const body = await res.json();
       if (body?.available && body.data) return body.data as WeatherData;
@@ -380,7 +383,7 @@ const App = () => {
 
   const fetchLiveTime = async (query: string): Promise<TimeData | null> => {
     try {
-      const res = await fetch(`/api/time?query=${encodeURIComponent(query)}`);
+      const res = await fetch(`${API_BASE}/api/time?query=${encodeURIComponent(query)}`);
       if (!res.ok) return null;
       const body = await res.json();
       if (body?.available && body.data) return body.data as TimeData;
@@ -688,7 +691,7 @@ ${geminiStyle}`;
     }
 
     try {
-      const res = await fetch('/api/chat/stream', {
+      const res = await fetch(`${API_BASE}/api/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
